@@ -1,5 +1,5 @@
 
-use std::{fs::File, io::{Cursor, Read}, num::ParseIntError, path::PathBuf, sync::{Arc, Mutex}, time::{Duration, SystemTime}};
+use std::{collections::HashMap, fs::File, io::{Cursor, Read}, num::ParseIntError, path::PathBuf, sync::{Arc, Mutex}, time::{Duration, SystemTime}};
 
 use aes_siv::{Aes256SivAead, Nonce};
 use base64::{alphabet::STANDARD, engine::general_purpose};
@@ -11,7 +11,7 @@ use keystore::{init_keystore, software::{NoEncryptor, SoftwareEncryptor, Softwar
 use log::{debug, error, info, warn};
 use omnisette::{default_provider, AnisetteHeaders, DefaultAnisetteProvider};
 use open_absinthe::nac::HardwareConfig;
-use openssl::sha::sha256;
+use openssl::{bn::BigNumContext, ec::{EcKey, PointConversionForm}, rsa::Rsa, sha::sha256};
 use plist::{Data, Dictionary, Value};
 use rustpush::{APSConnectionResource, APSState, Attachment, CircleClientSession, CircleServerSession, CompactECKey, ConversationData, DebugMutex, DebugRwLock, EntitlementAuthState, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IdmsAuthListener, IdmsMessage, IndexedMessagePart, KeyedArchive, LoginDelegate, MADRID_SERVICE, MMCSFile, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, ShareProfileMessage, SharedPoster, TokenProvider, UpdateProfileMessage, authenticate_apple, authenticate_smsless, cloud_messages::{CloudMessagesClient, MESSAGES_SERVICE}, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitSession, CloudKitState, DeleteRecordOperation, FetchZoneOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier}, facetime::{FACETIME_SERVICE, FTClient, FTMember, FTMessage, FTState, VIDEO_SERVICE}, findmy::{BeaconNamingRecord, FindMyClient, FindMyState, FindMyStateManager, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, keychain::{CloudKey, KEYCHAIN_ZONES, KeychainClient, KeychainClientState}, login_apple_delegates, macos::MacOSConfig, name_photo_sharing::{IMessageNameRecord, IMessageNicknameRecord, IMessagePosterRecord, ProfilesClient}, passwords::{PasswordManager, PasswordState, SHARED_PASSWORDS_SERVICE}, pcs::{PCSKey, PCSPrivateKey}, posterkit::{PhotoPosterContentsFrame, PosterType, SimplifiedIncomingCallPoster, SimplifiedPoster, SimplifiedTranscriptPoster, TranscriptDynamicUserData}, prepare_put, register, sharedstreams::{AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState, round_seconds}, statuskit::{StatusKitClient, StatusKitState, StatusKitStatus}};
 use sha2::Sha256;
@@ -25,10 +25,8 @@ use base64::Engine;
 use std::str::FromStr;
 use std::io::Seek;
 use rustpush::OSConfig;
-use std::fmt::{Display, Write as FmtWrite};
+use std::fmt::Write as FmtWrite;
 use omnisette::AnisetteProvider;
-use rand::Rng;
-use serde_json::json;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct SavedState {
@@ -164,7 +162,7 @@ async fn handle_record(mut record: IMessageNicknameRecord, client: &IMClient, ph
 
         to_poster.poster.r#type = PosterType::TranscriptDynamic { data: TranscriptDynamicUserData { identifier: "aurora_1".to_string() } };
 
-        let mut by = to_poster.to_poster().unwrap();
+        let by = to_poster.to_poster().unwrap();
         record.poster = Some(by);
 
         let mut existing = Some(existing.clone());
@@ -212,12 +210,319 @@ pub fn decode_hex(s: &str) -> Result<Vec<u8>, ParseIntError> {
         .collect()
 }
 
+const RELAY_HOST: &str = "https://registration-relay.beeper.com";
+const RELAY_CODE: &str = "73EW-E6JF-UYHZ-3Y9X";
+const RELAY_TOKEN: &str = "5c175851953ecaf5209185d897591badb6c3e712";
+
+const BPINDEX_SN: u8 = 0x10;
+const BPINDEX_MAIN_ID: u8 = 0x11;
+const BPINDEX_PUSH_TOKEN: u8 = 0x21;
+const BPINDEX_PUSH_CERT: u8 = 0x22;
+const BPINDEX_PUSH_KEY: u8 = 0x23;
+const BPINDEX_ID_CERT: u8 = 0x31;
+const BPINDEX_ID_PRIV_KEY: u8 = 0x32;
+const BPINDEX_EC_PUB_KEY: u8 = 0x41;
+const BPINDEX_EC_PRIV_KEY: u8 = 0x42;
+const BPINDEX_RSA_PUB_KEY: u8 = 0x51;
+const BPINDEX_RSA_PRIV_KEY: u8 = 0x52;
+
+fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(|s| s.as_str())
+}
+
+fn append_bbox_tlv(out: &mut Vec<u8>, index: u8, value: &[u8]) {
+    let len = value.len();
+    assert!(len <= 0xffff, "BBOX value too large");
+    out.push(index);
+    out.push((len >> 8) as u8);
+    out.push((len & 0xff) as u8);
+    out.extend_from_slice(value);
+}
+
+fn wrap_identity_key(key: &[u8]) -> Vec<u8> {
+    let len = key.len() as u16;
+    [len.to_be_bytes().as_slice(), key].concat()
+}
+
+fn pem_to_der(pem: &[u8]) -> Result<Vec<u8>, PushError> {
+    let text = std::str::from_utf8(pem).map_err(|_| PushError::BadMsg)?;
+    let b64: String = text.lines().filter(|line| !line.starts_with("-----")).collect();
+    general_purpose::STANDARD.decode(b64.trim()).map_err(|_| PushError::BadMsg)
+}
+
+#[derive(Serialize, Deserialize)]
+struct GsaConfig {
+    user: String,
+    pass: Data,
+}
+
+fn rsa_private_pkcs1_der(der: &[u8]) -> Result<Vec<u8>, PushError> {
+    // Keystore stores PKCS#8 DER; p-radar expects PKCS#1 DER when possible.
+    let rsa = Rsa::private_key_from_der(der)?;
+    let pem = rsa.private_key_to_pem()?;
+    let text = std::str::from_utf8(&pem).map_err(|_| PushError::BadMsg)?;
+    if text.contains("BEGIN RSA PRIVATE KEY") {
+        pem_to_der(&pem)
+    } else {
+        Ok(der.to_vec())
+    }
+}
+
+fn keystore_rsa_der(alias: &str) -> Result<Vec<u8>, PushError> {
+    #[derive(Deserialize, Default)]
+    struct KeystoreState {
+        keys: HashMap<String, Data>,
+    }
+    let state: KeystoreState = plist::from_file("keystore.plist").map_err(|_| PushError::BadMsg)?;
+    let entry = state.keys.get(alias).ok_or(PushError::BadMsg)?;
+    let val: Value = plist::from_bytes(entry.as_ref()).map_err(|_| PushError::BadMsg)?;
+    if let Value::Dictionary(dict) = val {
+        if let Some(Value::Data(d)) = dict.get("Rsa") {
+            let bytes: &[u8] = d.as_ref();
+            return Ok(bytes.to_vec());
+        }
+    }
+    Err(PushError::BadMsg)
+}
+
+fn legacy_keys_from_config() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>), PushError> {
+    let val: Value = plist::from_file("config.plist").map_err(|_| PushError::BadMsg)?;
+    let legacy = val
+        .as_dictionary()
+        .and_then(|d| d.get("identity"))
+        .and_then(|v| v.as_dictionary())
+        .and_then(|d| d.get("legacy"))
+        .and_then(|v| v.as_dictionary())
+        .ok_or(PushError::BadMsg)?;
+    let ec_priv = legacy
+        .get("signing_key")
+        .and_then(|v| v.as_data())
+        .ok_or(PushError::BadMsg)?
+        .as_ref()
+        .to_vec();
+    let rsa_priv = legacy
+        .get("encryption_key")
+        .and_then(|v| v.as_data())
+        .ok_or(PushError::BadMsg)?
+        .as_ref()
+        .to_vec();
+
+    let ec_key = EcKey::private_key_from_der(&ec_priv)?;
+    let mut ctx = BigNumContext::new()?;
+    let ec_pub = ec_key.public_key().to_bytes(
+        ec_key.group(),
+        PointConversionForm::UNCOMPRESSED,
+        &mut ctx,
+    )?;
+
+    let rsa_key = Rsa::private_key_from_der(&rsa_priv)?;
+    let rsa_pub = rsa_key.public_key_to_der_pkcs1()?;
+
+    Ok((
+        wrap_identity_key(&ec_pub),
+        ec_priv,
+        wrap_identity_key(&rsa_pub),
+        rsa_priv,
+    ))
+}
+
+fn primary_email(user: &IDSUser) -> Option<String> {
+    for reg in user.registration.values() {
+        for handle in &reg.handles {
+            if let Some(email) = handle.strip_prefix("mailto:") {
+                return Some(email.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn build_bbox(serial: &str, main_id: &str, state: &SavedState) -> Result<String, PushError> {
+    let push = &state.push;
+    let user = &state.users[0];
+    let token = push.token.as_ref().ok_or(PushError::TokenMissing)?;
+    let keypair = push.keypair.as_ref().ok_or(PushError::TokenMissing)?;
+
+    let push_key = rsa_private_pkcs1_der(&keystore_rsa_der(&keypair.private.0)?)?;
+    let id_key = rsa_private_pkcs1_der(&keystore_rsa_der(&user.auth_keypair.private.0)?)?;
+    let id_rsa = Rsa::private_key_from_der(&id_key)?;
+    let id_rsa_pub = wrap_identity_key(&id_rsa.public_key_to_der_pkcs1()?);
+    let (ec_pub, ec_priv, _, _) = legacy_keys_from_config()?;
+
+    let mut raw = Vec::new();
+    append_bbox_tlv(&mut raw, BPINDEX_SN, serial.as_bytes());
+    append_bbox_tlv(&mut raw, BPINDEX_MAIN_ID, main_id.as_bytes());
+    append_bbox_tlv(&mut raw, BPINDEX_PUSH_TOKEN, token);
+    append_bbox_tlv(&mut raw, BPINDEX_PUSH_CERT, &keypair.cert);
+    append_bbox_tlv(&mut raw, BPINDEX_PUSH_KEY, &push_key);
+    append_bbox_tlv(&mut raw, BPINDEX_ID_CERT, &user.auth_keypair.cert);
+    append_bbox_tlv(&mut raw, BPINDEX_ID_PRIV_KEY, &id_key);
+    append_bbox_tlv(&mut raw, BPINDEX_EC_PUB_KEY, &ec_pub);
+    append_bbox_tlv(&mut raw, BPINDEX_EC_PRIV_KEY, &ec_priv);
+    // p-radar signHash uses 0x52; it must match 0x31 ID cert (same as 0x32), not legacy NGM key.
+    append_bbox_tlv(&mut raw, BPINDEX_RSA_PUB_KEY, &id_rsa_pub);
+    append_bbox_tlv(&mut raw, BPINDEX_RSA_PRIV_KEY, &id_key);
+
+    Ok(general_purpose::STANDARD.encode(raw))
+}
+
+async fn load_bbox_serial(args: &[String]) -> Result<String, PushError> {
+    if let Some(serial) = arg_value(args, "--serial") {
+        return Ok(serial.to_string());
+    }
+    if std::path::Path::new("hwconfig.plist").exists() {
+        if let Ok(config) = plist::from_file::<_, RelayConfig>("hwconfig.plist") {
+            return Ok(config.get_serial_number());
+        }
+    }
+    let config = relay_config().await;
+    Ok(config.get_serial_number())
+}
+
+async fn export_bbox_with_relay_defaults() {
+    let args: Vec<String> = std::env::args().collect();
+    let output = arg_value(&args, "--output").unwrap_or("caches.json");
+
+    if !std::path::Path::new("hwconfig.plist").exists() {
+        let config = relay_config().await;
+        fs::write("hwconfig.plist", plist_to_string(config.as_ref()).unwrap()).await.unwrap();
+    }
+
+    init_keystore(SoftwareKeystore {
+        state: plist::from_file("keystore.plist").unwrap_or_default(),
+        update_state: Box::new(|state| {
+            plist::to_file_xml("keystore.plist", state).unwrap();
+        }),
+        encryptor: NoEncryptor,
+    });
+
+    let saved: SavedState = match plist::from_file("config.plist") {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("BBOX export failed: cannot read config.plist: {e}");
+            std::process::exit(1);
+        }
+    };
+    if saved.users.is_empty() {
+        eprintln!("BBOX export failed: config.plist has no users");
+        std::process::exit(1);
+    }
+
+    let serial = match load_bbox_serial(&args).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("BBOX export failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let main_id = arg_value(&args, "--main-id")
+        .map(|s| s.to_string())
+        .or_else(|| primary_email(&saved.users[0]))
+        .or_else(|| plist::from_file::<_, GsaConfig>("gsa.plist").ok().map(|g| g.user));
+    let main_id = match main_id {
+        Some(v) => v,
+        None => {
+            eprintln!("BBOX export failed: could not determine Apple ID email");
+            std::process::exit(1);
+        }
+    };
+
+    match build_bbox(&serial, &main_id, &saved) {
+        Ok(bbox) => {
+            let json = serde_json::to_string_pretty(&vec![bbox]).unwrap();
+            fs::write(output, json).await.expect("failed to write output");
+            println!("Wrote {} (1 entry)", output);
+            println!("Serial: {serial}");
+            println!("Main ID: {main_id}");
+        }
+        Err(e) => {
+            eprintln!("BBOX export failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn lookup_error_code(err: &PushError) -> Option<u64> {
+    match err {
+        PushError::LookupFailed(code) => Some(code.0),
+        PushError::DoNotRetry(inner) => lookup_error_code(inner),
+        _ => None,
+    }
+}
+
+fn format_lookup_target(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.contains(':') {
+        raw.to_string()
+    } else if raw.contains('@') {
+        format!("mailto:{raw}")
+    } else {
+        format!("tel:{raw}")
+    }
+}
+
+async fn test_ids_lookup(client: &IMClient, handle: &str) {
+    let args: Vec<String> = std::env::args().collect();
+    let target = args
+        .get(2)
+        .map(|s| s.as_str())
+        .or_else(|| arg_value(&args, "--target"))
+        .unwrap_or("mailto:hilmi.azizi19@icloud.com");
+    let target = format_lookup_target(target);
+
+    info!("IDS id-query test (same API p-radar uses, via APNs)");
+    info!("  self handle: {handle}");
+    info!("  target: {target}");
+
+    match client
+        .identity
+        .validate_targets(&[target.clone()], MADRID_SERVICE.name, handle)
+        .await
+    {
+        Ok(valid) => {
+            println!("LOOKUP OK");
+            println!("  self: {handle}");
+            println!("  target: {target}");
+            println!("  valid: {valid:?}");
+        }
+        Err(err) => {
+            if let Some(code) = lookup_error_code(&err) {
+                println!("LOOKUP FAILED status={code}");
+                println!("  (p-radar prints this as QUERY-ERROR:{code})");
+            } else {
+                println!("LOOKUP ERROR: {err}");
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn relay_config() -> Arc<RelayConfig> {
+    let token = Some(RELAY_TOKEN.to_string());
+    Arc::new(RelayConfig {
+        version: RelayConfig::get_versions(RELAY_HOST, RELAY_CODE, &token).await.unwrap(),
+        icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
+        aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
+        dev_uuid: Uuid::new_v4().to_string(),
+        protocol_version: 1640,
+        host: RELAY_HOST.to_string(),
+        code: RELAY_CODE.to_string(),
+        beeper_token: token,
+        udid: None,
+    })
+}
+
 #[tokio::main(worker_threads = 1)]
 async fn main() {
     if let Err(_) = std::env::var("RUST_LOG") {
         std::env::set_var("RUST_LOG", "debug");
     }
     pretty_env_logger::try_init().unwrap();
+
+    if std::env::args().nth(1).as_deref() == Some("--export-bbox") {
+        export_bbox_with_relay_defaults().await;
+        return;
+    }
 
     // let record = IMessagePosterRecord {
     //     low_res_poster: fs::read("posters/image_style_plain/image.png").await.unwrap(),
@@ -257,13 +562,7 @@ async fn main() {
 		}
 	};
 
-    #[derive(Serialize, Deserialize)]
-    struct GSAConfig {
-        user: String,
-        pass: Data,
-    }
-
-    let gsa: GSAConfig = if let Ok(config) = plist::from_file("gsa.plist") {
+    let gsa: GsaConfig = if let Ok(config) = plist::from_file("gsa.plist") {
         config
     } else {
         print!("Username: ");
@@ -273,53 +572,42 @@ async fn main() {
         std::io::stdout().flush().unwrap();
         let password = read_input().await;
 
-        GSAConfig { user: username.trim().to_string(), pass: sha256(password.trim().as_bytes()).to_vec().into() }
+        GsaConfig { user: username.trim().to_string(), pass: sha256(password.trim().as_bytes()).to_vec().into() }
     };
 
     plist::to_file_xml("gsa.plist", &gsa).unwrap();
     
     
     
-    let config: Arc<MacOSConfig> = Arc::new(if let Ok(config) = plist::from_file("hwconfig.plist") {
-        config
-    } else {
-        println!("Missing hardware config!");
-        println!("The easiest way to get your hardware config is to extract it from validation data from a Mac.");
-        println!("This validation data will not be used to authenticate, and therefore does not need to be recent or valid.");
-        println!("If you need help obtaining validation data, please visit https://github.com/beeper/mac-registration-provider");
-        println!("As long as the hardware identifiers are valid rustpush will work fine.");
-        println!("Validation data will not be required for subsequent re-registrations.");
-        // save hardware config
-        print!("Validation data: ");
-        std::io::stdout().flush().unwrap();
-        let validation_data_b64 = read_input().await;
-
-        let validation_data = general_purpose::STANDARD.decode(validation_data_b64.trim()).unwrap();
-        let extracted = HardwareConfig::from_validation_data(&validation_data).unwrap();
-
-        MacOSConfig {
-            inner: extracted,
-            version: "13.6.4".to_string(),
-            protocol_version: 1660,
-            device_id: Uuid::new_v4().to_string(),
-            icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
-            aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
-            udid: Some("55A1CFBF5BB56AD1159BD2CB7D6FF546E48EAAE4BF16188A07B1FB9C83138CA2".to_string()),
-        }
-    });
-    // let host = "https://registration-relay.beeper.com".to_string();
-    // let code = "BZUL-7TB6-JUGN-6Q6W".to_string();
-    // let token = Some("5c175851953ecaf5209185d897591badb6c3e712".to_string());
-    // let config: Arc<RelayConfig> = Arc::new(RelayConfig {
-    //     version: RelayConfig::get_versions(&host, &code, &token).await.unwrap(),
-    //     icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
-    //     aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
-    //     dev_uuid: Uuid::new_v4().to_string(),
-    //     protocol_version: 1640,
-    //     host,
-    //     code,
-    //     beeper_token: token,
+    // let config: Arc<MacOSConfig> = Arc::new(if let Ok(config) =
+    // plist::from_file("hwconfig.plist") {
+    //     config
+    // } else {
+    //     println!("Missing hardware config!");
+    //     println!("The easiest way to get your hardware config is to extract it from validation data from a Mac.");
+    //     println!("This validation data will not be used to authenticate, and therefore does not need to be recent or valid.");
+    //     println!("If you need help obtaining validation data, please visit https://github.com/beeper/mac-registration-provider");
+    //     println!("As long as the hardware identifiers are valid rustpush will work fine.");
+    //     println!("Validation data will not be required for subsequent re-registrations.");
+    //     // save hardware config
+    //     print!("Validation data: ");
+    //     std::io::stdout().flush().unwrap();
+    //     let validation_data_b64 = read_input().await;
+    //
+    //     let validation_data = general_purpose::STANDARD.decode(validation_data_b64.trim()).unwrap();
+    //     let extracted = HardwareConfig::from_validation_data(&validation_data).unwrap();
+    //
+    //     MacOSConfig {
+    //         inner: extracted,
+    //         version: "13.6.4".to_string(),
+    //         protocol_version: 1660,
+    //         device_id: Uuid::new_v4().to_string(),
+    //         icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
+    //         aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
+    //         udid: Some("55A1CFBF5BB56AD1159BD2CB7D6FF546E48EAAE4BF16188A07B1FB9C83138CA2".to_string()),
+    //     }
     // });
+    let config = relay_config().await;
     fs::write("hwconfig.plist", plist_to_string(config.as_ref()).unwrap()).await.unwrap();
 	
     let saved_state: Option<SavedState> = plist::from_reader_xml(Cursor::new(&data)).ok();
@@ -487,12 +775,17 @@ async fn main() {
         users: users.clone()
     });
     fs::write("config.plist", plist_to_string(state.lock().unwrap().as_ref().unwrap()).unwrap()).await.unwrap();
+    info!("Credentials saved to config.plist. Export p-radar cache: ./target/release/rustpush-test --export-bbox");
     
     let client = IMClient::new(connection.clone(), users, identity, services, "id_cache.plist".into(), config.clone(), Box::new(move |updated_keys| {
         state.lock().unwrap().as_mut().unwrap().users = updated_keys;
         std::fs::write("config.plist", plist_to_string(state.lock().unwrap().as_ref().unwrap()).unwrap()).unwrap();
     })).await;
     let handle = client.identity.get_handles().await[0].clone();
+    if std::env::args().nth(1).as_deref() == Some("--test-lookup") {
+        test_ids_lookup(&client, &handle).await;
+        return;
+    }
     client.identity.ensure_private_self(&mut *client.identity.cache.lock().await, &handle, true).await.unwrap();
 
     // client.identity.refresh_now().await.unwrap();
@@ -522,7 +815,7 @@ async fn main() {
 
     let listener = IdmsAuthListener::new(connection.clone()).await;
 
-    error!("2fa code: {}", anisette_client.lock().await.provider.get_2fa_code().await.unwrap());
+    // error!("2fa code: {}", anisette_client.lock().await.provider.get_2fa_code().await.unwrap());
     // plist::to_file_xml(&id_path, &state).unwrap();
 
     // let state: StatusKitState = plist::from_file("statuskit.plist").unwrap_or_default();
@@ -657,8 +950,8 @@ async fn main() {
 
         // findmy_client.sync_item_positions().await.unwrap();
         // findmy_client.update_beacon_name(&BeaconNamingRecord {
-        //     emoji: "🎧".to_string(),
-        //     name: "test4’s hielalf".to_string(),
+        //     emoji: "????".to_string(),
+        //     name: "test4???s hielalf".to_string(),
         //     associated_beacon: "2793F9C5-5660-4F56-96D3-26A91859F982".to_string(),
         //     role_id: 10,
         // }).await.unwrap();
