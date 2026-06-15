@@ -1188,8 +1188,8 @@ pub struct APSInterestToken {
 
 impl Drop for APSInterestToken {
     fn drop(&mut self) {
-        // we don't care if it succeeds or not; we want to decrement no matter what
-        self.topics_channel.try_send((self.topics.clone(), false)).expect("APS backed up??");
+        // Channel may already be closed when APS is tearing down; ignore errors on exit.
+        let _ = self.topics_channel.try_send((self.topics.clone(), false));
     }
 }
 

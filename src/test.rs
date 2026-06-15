@@ -1,5 +1,5 @@
 
-use std::{collections::HashMap, fs::File, io::{Cursor, Read}, num::ParseIntError, path::PathBuf, sync::{Arc, Mutex}, time::{Duration, SystemTime}};
+use std::{collections::HashMap, fs::File, io::{Cursor, Read}, num::ParseIntError, path::{Path, PathBuf}, sync::{Arc, Mutex}, time::{Duration, SystemTime}};
 
 use aes_siv::{Aes256SivAead, Nonce};
 use base64::{alphabet::STANDARD, engine::general_purpose};
@@ -461,28 +461,114 @@ fn format_lookup_target(raw: &str) -> String {
     }
 }
 
+fn collect_lookup_targets(args: &[String]) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut i = 2;
+    while i < args.len() {
+        if args[i] == "--target" {
+            if let Some(t) = args.get(i + 1) {
+                targets.push(format_lookup_target(t));
+                i += 2;
+                continue;
+            }
+        } else if !args[i].starts_with('-') {
+            targets.push(format_lookup_target(&args[i]));
+        }
+        i += 1;
+    }
+    if targets.is_empty() {
+        targets.push(format_lookup_target("mailto:hilmi.azizi19@icloud.com"));
+    }
+    targets
+}
+
+fn lookup_plists_ready() -> bool {
+    for path in ["config.plist", "hwconfig.plist", "keystore.plist"] {
+        if !Path::new(path).exists() {
+            return false;
+        }
+    }
+    let Ok(saved) = plist::from_file::<_, SavedState>("config.plist") else {
+        return false;
+    };
+    !saved.users.is_empty() && !saved.users[0].registration.is_empty()
+}
+
+async fn run_lookup_from_plists() {
+    init_keystore(SoftwareKeystore {
+        state: plist::from_file("keystore.plist").unwrap_or_default(),
+        update_state: Box::new(|state| {
+            plist::to_file_xml("keystore.plist", state).unwrap();
+        }),
+        encryptor: NoEncryptor,
+    });
+
+    let saved_state: SavedState = plist::from_file("config.plist")
+        .expect("config.plist missing or invalid SavedState");
+    let config: Arc<RelayConfig> = Arc::new(
+        plist::from_file("hwconfig.plist").expect("hwconfig.plist missing or invalid RelayConfig"),
+    );
+
+    info!("Fast lookup: using cached plists (skipping relay, GSA login, and registration)");
+
+    let state: Arc<Mutex<Option<SavedState>>> = Arc::new(Mutex::new(Some(saved_state.clone())));
+    let (connection, error) = APSConnectionResource::new(
+        config.clone(),
+        Some(saved_state.push.clone()),
+    )
+    .await;
+
+    if let Some(error) = error {
+        panic!("{}", error);
+    }
+
+    let services = &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE];
+    let state_for_client = state.clone();
+    let client = IMClient::new(
+        connection.clone(),
+        saved_state.users,
+        saved_state.identity,
+        services,
+        "id_cache.plist".into(),
+        config.clone(),
+        Box::new(move |updated_keys| {
+            if let Some(saved) = state_for_client.lock().unwrap().as_mut() {
+                saved.users = updated_keys;
+                std::fs::write(
+                    "config.plist",
+                    plist_to_string(saved).unwrap(),
+                )
+                .unwrap();
+            }
+        }),
+    )
+    .await;
+
+    let handle = client.identity.get_handles().await[0].clone();
+    test_ids_lookup(&client, &handle).await;
+
+    // Drop client before APS so topic interest tokens unregister cleanly.
+    drop(client);
+    drop(connection);
+}
+
 async fn test_ids_lookup(client: &IMClient, handle: &str) {
     let args: Vec<String> = std::env::args().collect();
-    let target = args
-        .get(2)
-        .map(|s| s.as_str())
-        .or_else(|| arg_value(&args, "--target"))
-        .unwrap_or("mailto:hilmi.azizi19@icloud.com");
-    let target = format_lookup_target(target);
+    let targets = collect_lookup_targets(&args);
 
     info!("IDS id-query test (same API p-radar uses, via APNs)");
     info!("  self handle: {handle}");
-    info!("  target: {target}");
+    info!("  targets ({}): {targets:?}", targets.len());
 
     match client
         .identity
-        .validate_targets(&[target.clone()], MADRID_SERVICE.name, handle)
+        .validate_targets(&targets, MADRID_SERVICE.name, handle)
         .await
     {
         Ok(valid) => {
             println!("LOOKUP OK");
             println!("  self: {handle}");
-            println!("  target: {target}");
+            println!("  queried: {targets:?}");
             println!("  valid: {valid:?}");
         }
         Err(err) => {
@@ -521,6 +607,11 @@ async fn main() {
 
     if std::env::args().nth(1).as_deref() == Some("--export-bbox") {
         export_bbox_with_relay_defaults().await;
+        return;
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("--test-lookup") && lookup_plists_ready() {
+        run_lookup_from_plists().await;
         return;
     }
 

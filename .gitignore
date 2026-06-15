@@ -9,6 +9,14 @@
 /jniLibs
 /id_cache.plist
 /hwconfig.plist
+/keystore.plist
+/gsa.plist
+/findmy.plist
+/sharedstreams.plist
+/trustedpeers.plist
+/cloudkit.plist
+/caches.json
+/anisette_test/
 /anisette_test
 /certs/fairplay/*
 /keystore/target
