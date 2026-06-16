@@ -210,9 +210,13 @@ pub fn decode_hex(s: &str) -> Result<Vec<u8>, ParseIntError> {
         .collect()
 }
 
-const RELAY_HOST: &str = "https://registration-relay.beeper.com";
-const RELAY_CODE: &str = "73EW-E6JF-UYHZ-3Y9X";
+const DEFAULT_RELAY_HOST: &str = "https://registration-relay.beeper.com";
 const RELAY_TOKEN: &str = "5c175851953ecaf5209185d897591badb6c3e712";
+
+struct RelaySettings {
+    host: String,
+    code: String,
+}
 
 const BPINDEX_SN: u8 = 0x10;
 const BPINDEX_MAIN_ID: u8 = 0x11;
@@ -228,6 +232,41 @@ const BPINDEX_RSA_PRIV_KEY: u8 = 0x52;
 
 fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(|s| s.as_str())
+}
+
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|a| a == flag)
+}
+
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    let prefix = format!("{flag}=");
+    for arg in args {
+        if let Some(value) = arg.strip_prefix(&prefix) {
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    arg_value(args, flag).map(|s| s.to_string())
+}
+
+fn relay_settings_from_args(args: &[String]) -> Result<RelaySettings, String> {
+    let code = flag_value(args, "--relay-code")
+        .or_else(|| std::env::var("RUSTPUSH_RELAY_CODE").ok())
+        .ok_or_else(|| {
+            "missing --relay-code=XXXX (pairing code from mac-registration-provider / registration-relay)".to_string()
+        })?;
+    let host = flag_value(args, "--relay-host")
+        .or_else(|| std::env::var("RUSTPUSH_RELAY_HOST").ok())
+        .unwrap_or_else(|| DEFAULT_RELAY_HOST.to_string());
+    Ok(RelaySettings { host, code })
+}
+
+fn relay_settings_error(msg: &str) -> ! {
+    eprintln!("{msg}");
+    eprintln!("Example: ./rustpush-test --register --relay-code=ABCD-EFGH-IJKL-MNOP");
+    eprintln!("Optional: --relay-host=https://your-registration-relay.example.com");
+    std::process::exit(1);
 }
 
 fn append_bbox_tlv(out: &mut Vec<u8>, index: u8, value: &[u8]) {
@@ -370,12 +409,7 @@ async fn load_bbox_serial(args: &[String]) -> Result<String, PushError> {
     if let Some(serial) = arg_value(args, "--serial") {
         return Ok(serial.to_string());
     }
-    if std::path::Path::new("hwconfig.plist").exists() {
-        if let Ok(config) = plist::from_file::<_, RelayConfig>("hwconfig.plist") {
-            return Ok(config.get_serial_number());
-        }
-    }
-    let config = relay_config().await;
+    let config = resolve_relay_config(args, false).await;
     Ok(config.get_serial_number())
 }
 
@@ -383,10 +417,7 @@ async fn export_bbox_with_relay_defaults() {
     let args: Vec<String> = std::env::args().collect();
     let output = arg_value(&args, "--output").unwrap_or("caches.json");
 
-    if !std::path::Path::new("hwconfig.plist").exists() {
-        let config = relay_config().await;
-        fs::write("hwconfig.plist", plist_to_string(config.as_ref()).unwrap()).await.unwrap();
-    }
+    let _ = resolve_relay_config(&args, false).await;
 
     init_keystore(SoftwareKeystore {
         state: plist::from_file("keystore.plist").unwrap_or_default(),
@@ -583,19 +614,50 @@ async fn test_ids_lookup(client: &IMClient, handle: &str) {
     }
 }
 
-async fn relay_config() -> Arc<RelayConfig> {
+async fn relay_config(settings: &RelaySettings) -> Arc<RelayConfig> {
     let token = Some(RELAY_TOKEN.to_string());
+    info!(
+        "Fetching relay version info from {} (code {})",
+        settings.host, settings.code
+    );
     Arc::new(RelayConfig {
-        version: RelayConfig::get_versions(RELAY_HOST, RELAY_CODE, &token).await.unwrap(),
+        version: RelayConfig::get_versions(&settings.host, &settings.code, &token)
+            .await
+            .unwrap(),
         icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
         aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
         dev_uuid: Uuid::new_v4().to_string(),
         protocol_version: 1640,
-        host: RELAY_HOST.to_string(),
-        code: RELAY_CODE.to_string(),
+        host: settings.host.clone(),
+        code: settings.code.clone(),
         beeper_token: token,
         udid: None,
     })
+}
+
+async fn resolve_relay_config(args: &[String], force_relay_fetch: bool) -> Arc<RelayConfig> {
+    if !force_relay_fetch && Path::new("hwconfig.plist").exists() {
+        if let Ok(config) = plist::from_file::<_, RelayConfig>("hwconfig.plist") {
+            info!(
+                "Using cached hwconfig.plist (serial {})",
+                config.get_serial_number()
+            );
+            return Arc::new(config);
+        }
+    }
+    let settings = match relay_settings_from_args(args) {
+        Ok(s) => s,
+        Err(msg) => relay_settings_error(&msg),
+    };
+    let config = relay_config(&settings).await;
+    fs::write("hwconfig.plist", plist_to_string(config.as_ref()).unwrap())
+        .await
+        .unwrap();
+    info!(
+        "Saved hwconfig.plist (serial {})",
+        config.get_serial_number()
+    );
+    config
 }
 
 #[tokio::main(worker_threads = 1)]
@@ -605,14 +667,24 @@ async fn main() {
     }
     pretty_env_logger::try_init().unwrap();
 
-    if std::env::args().nth(1).as_deref() == Some("--export-bbox") {
+    let args: Vec<String> = std::env::args().collect();
+    let register_only = has_flag(&args, "--register");
+    let test_lookup = has_flag(&args, "--test-lookup");
+
+    if has_flag(&args, "--export-bbox") {
         export_bbox_with_relay_defaults().await;
         return;
     }
 
-    if std::env::args().nth(1).as_deref() == Some("--test-lookup") && lookup_plists_ready() {
+    if test_lookup && lookup_plists_ready() {
         run_lookup_from_plists().await;
         return;
+    }
+
+    if register_only && flag_value(&args, "--relay-code").is_none() {
+        relay_settings_error(
+            "missing --relay-code=... (--register always fetches a fresh relay identity)",
+        );
     }
 
     // let record = IMessagePosterRecord {
@@ -698,9 +770,8 @@ async fn main() {
     //         udid: Some("55A1CFBF5BB56AD1159BD2CB7D6FF546E48EAAE4BF16188A07B1FB9C83138CA2".to_string()),
     //     }
     // });
-    let config = relay_config().await;
-    fs::write("hwconfig.plist", plist_to_string(config.as_ref()).unwrap()).await.unwrap();
-	
+    let config = resolve_relay_config(&args, register_only).await;
+
     let saved_state: Option<SavedState> = plist::from_reader_xml(Cursor::new(&data)).ok();
     // let saved_state: Option<SavedState> = None;
 
@@ -855,8 +926,8 @@ async fn main() {
 
     let identity = saved_state.as_ref().map(|state| state.identity.clone()).unwrap_or(IDSNGMIdentity::new().unwrap());
 
-    if users[0].registration.is_empty() {
-        info!("Registering new identity...");
+    if users[0].registration.is_empty() || register_only {
+        info!("Registering identity with relay...");
         register(config.as_ref(), &*connection.state.read().await, services, &mut users, &identity).await.unwrap();
     }
 
@@ -866,15 +937,27 @@ async fn main() {
         users: users.clone()
     });
     fs::write("config.plist", plist_to_string(state.lock().unwrap().as_ref().unwrap()).unwrap()).await.unwrap();
-    info!("Credentials saved to config.plist. Export p-radar cache: ./target/release/rustpush-test --export-bbox");
-    
+    info!("Credentials saved to config.plist");
+
     let client = IMClient::new(connection.clone(), users, identity, services, "id_cache.plist".into(), config.clone(), Box::new(move |updated_keys| {
         state.lock().unwrap().as_mut().unwrap().users = updated_keys;
         std::fs::write("config.plist", plist_to_string(state.lock().unwrap().as_ref().unwrap()).unwrap()).unwrap();
     })).await;
     let handle = client.identity.get_handles().await[0].clone();
-    if std::env::args().nth(1).as_deref() == Some("--test-lookup") {
+
+    if register_only {
+        info!("Registration complete. serial={}", config.get_serial_number());
+        info!("Next: ./rustpush-test --test-lookup tel:+1...");
+        info!("Or:  ./rustpush-test --export-bbox --output caches.json");
+        drop(client);
+        drop(connection);
+        return;
+    }
+
+    if test_lookup {
         test_ids_lookup(&client, &handle).await;
+        drop(client);
+        drop(connection);
         return;
     }
     client.identity.ensure_private_self(&mut *client.identity.cache.lock().await, &handle, true).await.unwrap();

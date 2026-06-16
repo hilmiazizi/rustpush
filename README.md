@@ -33,23 +33,35 @@ Binary: `target/release/rustpush-test`
 
 ## Configure the registration relay
 
-Before first registration, set your relay credentials in `src/test.rs` (constants near the top):
+Registration needs a relay pairing code from your mac-registration-provider VM (one code per VM/identity).
 
-```rust
-const RELAY_HOST: &str = "https://registration-relay.beeper.com";
-const RELAY_CODE: &str = "YOUR-RELAY-CODE";
-const RELAY_TOKEN: &str = "YOUR-RELAY-TOKEN";
+```bash
+# Fresh register (always fetches new hwconfig from relay)
+RUST_LOG=info ./target/release/rustpush-test \
+  --register \
+  --relay-code=YOUR-RELAY-CODE
+
+# Self-hosted relay (optional; default is https://registration-relay.beeper.com)
+./target/release/rustpush-test \
+  --register \
+  --relay-host=https://relay.example.com \
+  --relay-code=YOUR-RELAY-CODE
 ```
 
-Rebuild after changing these values. The relay must bridge to a macOS VM whose SMBIOS serial matches the validation data returned by `get-version-info`. A `DeviceNotFound` / 404 on version info usually means the VM relay is offline, not an Apple ID login failure.
+The Beeper access token is built into the binary. Override relay host/code via CLI or env:
+
+- `RUSTPUSH_RELAY_CODE`
+- `RUSTPUSH_RELAY_HOST`
+
+After the first successful register, `hwconfig.plist` is cached. Lookup skips relay unless you pass `--register` again (which forces a fresh relay fetch).
 
 ## First-time registration
 
-1. Start the macOS VM and registration relay bridge.
+1. Start the macOS VM and registration relay bridge (mac-registration-provider connected to your relay).
 2. From the repo root, run:
 
 ```bash
-RUST_LOG=info ./target/release/rustpush-test
+RUST_LOG=info ./target/release/rustpush-test --register --relay-code=YOUR-RELAY-CODE
 ```
 
 3. Enter Apple ID and password when prompted (or pre-create `gsa.plist` — see below).
