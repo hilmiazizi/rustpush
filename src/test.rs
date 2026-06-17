@@ -13,7 +13,7 @@ use omnisette::{default_provider, AnisetteHeaders, DefaultAnisetteProvider};
 use open_absinthe::nac::HardwareConfig;
 use openssl::{bn::BigNumContext, ec::{EcKey, PointConversionForm}, rsa::Rsa, sha::sha256};
 use plist::{Data, Dictionary, Value};
-use rustpush::{APSConnectionResource, APSState, Attachment, CircleClientSession, CircleServerSession, CompactECKey, ConversationData, DebugMutex, DebugRwLock, EntitlementAuthState, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IdmsAuthListener, IdmsMessage, IndexedMessagePart, KeyedArchive, LoginDelegate, MADRID_SERVICE, MMCSFile, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, ShareProfileMessage, SharedPoster, TokenProvider, UpdateProfileMessage, authenticate_apple, authenticate_smsless, cloud_messages::{CloudMessagesClient, MESSAGES_SERVICE}, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitSession, CloudKitState, DeleteRecordOperation, FetchZoneOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier}, facetime::{FACETIME_SERVICE, FTClient, FTMember, FTMessage, FTState, VIDEO_SERVICE}, findmy::{BeaconNamingRecord, FindMyClient, FindMyState, FindMyStateManager, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, keychain::{CloudKey, KEYCHAIN_ZONES, KeychainClient, KeychainClientState}, login_apple_delegates, macos::MacOSConfig, name_photo_sharing::{IMessageNameRecord, IMessageNicknameRecord, IMessagePosterRecord, ProfilesClient}, passwords::{PasswordManager, PasswordState, SHARED_PASSWORDS_SERVICE}, pcs::{PCSKey, PCSPrivateKey}, posterkit::{PhotoPosterContentsFrame, PosterType, SimplifiedIncomingCallPoster, SimplifiedPoster, SimplifiedTranscriptPoster, TranscriptDynamicUserData}, prepare_put, register, sharedstreams::{AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState, round_seconds}, statuskit::{StatusKitClient, StatusKitState, StatusKitStatus}};
+use rustpush::{APSConnectionResource, APSState, Attachment, CircleClientSession, CircleServerSession, CompactECKey, ConversationData, DebugMutex, DebugRwLock, EntitlementAuthState, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IdmsAuthListener, IdmsMessage, IndexedMessagePart, KeyedArchive, LoginDelegate, MADRID_SERVICE, MMCSFile, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, ShareProfileMessage, SharedPoster, TokenProvider, UpdateAccountFinish, UpdateProfileMessage, authenticate_apple, authenticate_smsless, cloud_messages::{CloudMessagesClient, MESSAGES_SERVICE}, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitSession, CloudKitState, DeleteRecordOperation, FetchZoneOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier}, facetime::{FACETIME_SERVICE, FTClient, FTMember, FTMessage, FTState, VIDEO_SERVICE}, findmy::{BeaconNamingRecord, FindMyClient, FindMyState, FindMyStateManager, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, keychain::{CloudKey, KEYCHAIN_ZONES, KeychainClient, KeychainClientState}, login_apple_delegates, macos::MacOSConfig, name_photo_sharing::{IMessageNameRecord, IMessageNicknameRecord, IMessagePosterRecord, ProfilesClient}, passwords::{PasswordManager, PasswordState, SHARED_PASSWORDS_SERVICE}, pcs::{PCSKey, PCSPrivateKey}, posterkit::{PhotoPosterContentsFrame, PosterType, SimplifiedIncomingCallPoster, SimplifiedPoster, SimplifiedTranscriptPoster, TranscriptDynamicUserData}, prepare_put, register, request_update_account, sharedstreams::{AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState, round_seconds}, statuskit::{StatusKitClient, StatusKitState, StatusKitStatus}};
 use sha2::Sha256;
 use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}, process::Command, sync::RwLock};
 use tokio::io::AsyncWriteExt;
@@ -795,39 +795,92 @@ async fn main() {
     let mut users = if let Some(state) = saved_state.as_ref() {
         state.users.clone()
     } else {
-        // ask console for 2fa code, make sure it is only 6 digits, no extra characters
-        let tfa_closure = || {
-            println!("Enter 2FA code: ");
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input).unwrap();
-            input.trim().to_string()
-        };
-        
         let mut account = AppleAccount::new_with_anisette(config.get_gsa_config(&*connection.state.read().await, false), anisette_client.clone()).unwrap();
-        let result = account.login_email_pass(&gsa.user, gsa.pass.as_ref()).await.unwrap();
+        let mut login_state = account.login_email_pass(&gsa.user, gsa.pass.as_ref()).await.unwrap();
 
+        loop {
+            login_state = match login_state {
+                LoginState::NeedsSMS2FA => {
+                    let extras = account.get_auth_extras().await.unwrap();
+                    if let Some(state @ LoginState::NeedsSMS2FAVerification(_)) = extras.new_state {
+                        println!("A verification SMS has been sent to your trusted phone number.");
+                        state
+                    } else if let Some(phone) = extras.trusted_phone_numbers.first() {
+                        println!(
+                            "Sending verification SMS to {} (ends in {})...",
+                            phone.number_with_dial_code, phone.last_two_digits
+                        );
+                        account.send_sms_2fa_to_devices(phone.id).await.unwrap()
+                    } else {
+                        panic!("No trusted phone numbers on this Apple ID");
+                    }
+                }
+                LoginState::NeedsSMS2FAVerification(body) => {
+                    print!("Enter the 6-digit code from the SMS: ");
+                    std::io::stdout().flush().unwrap();
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).unwrap();
+                    account.verify_sms_2fa(input.trim().to_string(), body).await.unwrap()
+                }
+                LoginState::Needs2FAVerification => {
+                    print!("Enter the 6-digit verification code: ");
+                    std::io::stdout().flush().unwrap();
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).unwrap();
+                    account.verify_2fa(input.trim().to_string()).await.unwrap()
+                }
+                LoginState::NeedsDevice2FA => {
+                    println!("Apple requires two-factor authentication for this account.");
+                    println!("  1 = Send SMS code (recommended)");
+                    println!("  2 = Show code on a trusted iPhone/Mac");
+                    println!("  3 = Wait for sign-in approval here (often unreliable on Linux)");
+                    print!("Choose [1]: ");
+                    std::io::stdout().flush().unwrap();
+                    let mut choice = String::new();
+                    std::io::stdin().read_line(&mut choice).unwrap();
+                    match choice.trim() {
+                        "2" | "push" => account.send_2fa_to_devices().await.unwrap(),
+                        "3" | "circle" => break,
+                        _ => {
+                            let extras = account.get_auth_extras().await.unwrap();
+                            if let Some(state @ LoginState::NeedsSMS2FAVerification(_)) = extras.new_state {
+                                println!("A verification SMS has been sent to your trusted phone number.");
+                                state
+                            } else if let Some(phone) = extras.trusted_phone_numbers.first() {
+                                println!(
+                                    "Sending verification SMS to {} (ends in {})...",
+                                    phone.number_with_dial_code, phone.last_two_digits
+                                );
+                                account.send_sms_2fa_to_devices(phone.id).await.unwrap()
+                            } else {
+                                panic!("No trusted phone numbers on this Apple ID — try option 2 or 3");
+                            }
+                        }
+                    }
+                }
+                LoginState::LoggedIn => break,
+                LoginState::NeedsExtraStep(ref step) => {
+                    println!("Ignoring optional Apple ID step: {}", step);
+                    break;
+                }
+                other => panic!("Unexpected login state: {:?}", other),
+            }
+        }
 
         let spd = account.spd.as_ref().unwrap();
         let dsid = spd["DsPrsId"].as_unsigned_integer().unwrap();
 
-        // account.send_2fa_to_devices().await.unwrap();
-        // let result = account.verify_2fa(tfa_closure()).await.unwrap();
-
         let done = Arc::new(DebugMutex::new(account));
 
-        if let LoginState::NeedsDevice2FA = result {
+        if matches!(login_state, LoginState::NeedsDevice2FA) {
             let mut s = CircleClientSession::new(dsid, done.clone(), connection.get_token().await).await.unwrap();
 
             let listener = IdmsAuthListener::new(connection.clone()).await;
             let mut subscription = connection.messages_cont.subscribe();
 
-            
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input).unwrap();
-            let item = input.trim().to_string();
-
-            s.send_code(&item).await.unwrap();
-
+            println!("Waiting for Apple sign-in — approve on your iPhone/Mac, then enter the code when prompted.");
+            println!("If nothing appears within ~30s, press Ctrl+C and rerun; choose option 1 (SMS) instead.");
+            std::io::stdout().flush().unwrap();
 
             loop {
                 let msg = subscription.recv().await.unwrap();
@@ -838,6 +891,13 @@ async fn main() {
                         IdmsMessage::TeardownSignIn(_) => info!("Teardown sign in"),
                         IdmsMessage::RequestedSignIn(_) => info!("requested sign in code {}", anisette_client.lock().await.provider.get_2fa_code().await.unwrap()),
                         IdmsMessage::CircleRequest(c, _) => {
+                            if c.step == 2 {
+                                print!("Enter the 6-digit verification code shown on your trusted device: ");
+                                std::io::stdout().flush().unwrap();
+                                let mut input = String::new();
+                                std::io::stdin().read_line(&mut input).unwrap();
+                                s.send_code(input.trim()).await.unwrap();
+                            }
                             if s.handle_circle_request(&c).await.unwrap().is_some() {
                                 session = Some(s);
                                 break;
@@ -851,10 +911,24 @@ async fn main() {
         let account = done.lock().await;
 
         // account.update_postdata("Testing").await.unwrap();
-        let pet = account.get_pet().unwrap();
+        account.get_delegate_password().expect("Login succeeded but no delegate token was returned");
         let spd = account.spd.as_ref().unwrap();
 
-        let delegates = login_apple_delegates(&account, None, config.as_ref(), &[LoginDelegate::IDS, LoginDelegate::MobileMe]).await.unwrap();
+        let delegate_list = &[LoginDelegate::IDS, LoginDelegate::MobileMe];
+        let delegates = match login_apple_delegates(&account, None, config.as_ref(), delegate_list).await {
+            Err(PushError::MobileMeError(code, _)) if code == "MOBILEME_TERMS_OF_SERVICE_UPDATE" => {
+                info!("Accepting iCloud Terms of Service...");
+                match login_apple_delegates(&account, Some("termsAccepted=true"), config.as_ref(), delegate_list).await {
+                    Ok(delegates) => delegates,
+                    Err(PushError::MobileMeError(code, _)) if code == "MOBILEME_TERMS_OF_SERVICE_UPDATE" => {
+                        let (_, finish) = request_update_account(&account, config.as_ref()).await.unwrap();
+                        finish.accept_terms(delegate_list, &account, config.as_ref()).await.unwrap()
+                    }
+                    other => other.unwrap(),
+                }
+            }
+            other => other.unwrap(),
+        };
         let user = authenticate_apple(delegates.ids.unwrap(), config.as_ref()).await.unwrap();
 
         let mobileme = delegates.mobileme.unwrap();
