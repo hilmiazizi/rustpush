@@ -358,65 +358,85 @@ pub async fn request_update_account<T: AnisetteProvider>(account: &AppleAccount<
 
 
 pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T>, cookie: Option<&str>, os_config: &dyn OSConfig, delegates: &[LoginDelegate]) -> Result<DelegateResponses, PushError> {
-    let Some(pet) = account.get_delegate_password() else { panic!("No delegate password!") };
+    let Some(pet) = account.get_pet() else { panic!("No PET after GSA login — complete 2FA first") };
     let Some(spd) = &account.spd else { panic!("No spd!") };
 
     debug!("Got spd {:?}", spd);
     let adsid = spd.get("adsid").expect("No adsid!").as_string().unwrap();
-
     let username = account.username.as_ref().unwrap();
-    
-    // let request = AuthRequest {
-    //     apple_id: username.to_string(),
-    //     client_id: Uuid::new_v4().to_string(),
-    //     delegates: Value::Dictionary(Dictionary::from_iter(delegates.iter().map(|d| d.delegate()))),
-    //     password: pet.to_string()
-    // };
 
-    let request = V2AuthRequest {
+    let request = AuthRequest {
+        apple_id: username.to_string(),
+        client_id: Uuid::new_v4().to_string(),
         delegates: Value::Dictionary(Dictionary::from_iter(delegates.iter().map(|d| d.delegate()))),
-        protocol_version: "1.0".to_string(),
-        user_info: V2AuthUserInfo {
-            client_id: Uuid::new_v4().to_string().to_uppercase(),
-            language: "en-US".to_string(),
-            timezone: "America/New_York".to_string(),
-        }
+        password: pet.clone(),
     };
 
     let validation_data = os_config.generate_validation_data().await?;
 
     let base_headers = account.anisette.lock().await.get_headers().await?.clone();
-    let mut anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
+    let mut anisette_map = base_headers.clone();
+    // GSA login merges hardware_headers (serial/ROM); delegate login must too or
+    // X-Mme-Nas-Qualify won't match the device identity Apple expects.
+    anisette_map.extend(account.client_info.hardware_headers.clone());
+    let mut anisette_headers: HeaderMap = anisette_map.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
 
     if let Some(cookie) = cookie {
         anisette_headers.insert("Cookie", HeaderValue::from_str(cookie).unwrap());
     }
 
-    let resp = REQWEST.post(os_config.get_login_url())
+    let login_url = os_config.get_login_url();
+    info!(
+        "setup.icloud.com delegate login url={} user={} adsid={} validation_bytes={} serial={}",
+        login_url,
+        username,
+        adsid,
+        validation_data.len(),
+        os_config.get_serial_number(),
+    );
+
+    let resp = REQWEST.post(login_url)
             .header("Accept-Encoding", "gzip")
             .header("User-Agent", os_config.get_normal_ua("com.apple.iCloudHelper/282"))
             .header("X-Mme-Client-Info", os_config.get_mme_clientinfo(&os_config.get_aoskit_version()))
             .header("X-Mme-Nas-Qualify", base64_encode(&validation_data))
             .header("X-Apple-ADSID", adsid)
             .headers(anisette_headers.clone())
-            .basic_auth(username, Some(pet))
+            .basic_auth(username, Some(&pet))
             .body(plist_to_string(&request)?)
             .send()
             .await?;
+    let status = resp.status();
     let text = resp.text().await?;
 
-    let parsed = plist::Value::from_reader(Cursor::new(text.as_str()))?;
-    let parsed_dict = parsed.as_dictionary().unwrap();
+    if !status.is_success() {
+        warn!("setup.icloud.com HTTP {} body:\n{}", status, text);
+    }
+
+    let parsed = match plist::Value::from_reader(Cursor::new(text.as_str())) {
+        Ok(v) => v,
+        Err(err) => {
+            warn!("setup.icloud.com response is not valid plist: {err}");
+            return Err(PushError::AuthError(Value::String(text)));
+        }
+    };
+    let parsed_dict = parsed.as_dictionary().ok_or(PushError::AuthError(parsed.clone()))?;
 
     if let Some(error) = parsed_dict.get("localizedError") {
         let error = error.as_string().unwrap();
+        let description = parsed_dict.get("description").and_then(|d| d.as_string().map(|s| s.to_string()));
+        warn!(
+            "setup.icloud.com localizedError={} description={:?}\n{}",
+            error, description, text
+        );
         if error == "UNAUTHORIZED" {
             return Err(PushError::UnauthorizedAccountError);
         }
-        return Err(PushError::MobileMeError(error.to_string(), parsed_dict.get("description").and_then(|d| d.as_string().map(|s| s.to_string()))));
+        return Err(PushError::MobileMeError(error.to_string(), description));
     }
 
     if parsed_dict.get("status").unwrap().as_unsigned_integer().unwrap() != 0 {
+        warn!("setup.icloud.com non-zero status plist:\n{}", text);
         return Err(PushError::AuthError(parsed.clone()));
     }
 
@@ -446,6 +466,7 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
         mme.config = get_delegate(delegates, "com.apple.mobileme")?.expect("No MME??");
     }
 
+    info!("setup.icloud.com delegate login OK");
     Ok(DelegateResponses {
         ids: get_delegate(delegates, "com.apple.private.ids")?,
         mobileme: mme,

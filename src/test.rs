@@ -660,6 +660,22 @@ async fn resolve_relay_config(args: &[String], force_relay_fetch: bool) -> Arc<R
     config
 }
 
+fn format_delegate_login_error(err: &PushError) -> String {
+    match err {
+        PushError::UnauthorizedAccountError => {
+            "setup.icloud.com returned UNAUTHORIZED (see WARN lines above for raw plist). \
+             GSA login succeeded; this is delegate/device validation, not securityUpgrade/2FA."
+                .to_string()
+        }
+        PushError::MobileMeError(code, desc) => format!("setup.icloud.com MobileMeError: {code} ({desc:?})"),
+        PushError::AuthError(v) => format!("setup.icloud.com AuthError: {v:?}"),
+        PushError::DelegateLoginFailed(delegate, status, msg) => {
+            format!("delegate {delegate} failed status={status} msg={msg}")
+        }
+        other => format!("{other}"),
+    }
+}
+
 #[tokio::main(worker_threads = 1)]
 async fn main() {
     if let Err(_) = std::env::var("RUST_LOG") {
@@ -924,10 +940,17 @@ async fn main() {
                         let (_, finish) = request_update_account(&account, config.as_ref()).await.unwrap();
                         finish.accept_terms(delegate_list, &account, config.as_ref()).await.unwrap()
                     }
-                    other => other.unwrap(),
+                    Err(err) => {
+                        eprintln!("Delegate login failed after ToS retry: {}", format_delegate_login_error(&err));
+                        std::process::exit(1);
+                    }
                 }
             }
-            other => other.unwrap(),
+            Err(err) => {
+                eprintln!("Delegate login failed: {}", format_delegate_login_error(&err));
+                std::process::exit(1);
+            }
+            Ok(delegates) => delegates,
         };
         let user = authenticate_apple(delegates.ids.unwrap(), config.as_ref()).await.unwrap();
 
