@@ -85,7 +85,9 @@ impl OSConfig for RelayConfig {
     }
 
     fn get_udid(&self) -> String {
-        self.udid.clone().expect("missing udid!")
+        self.udid
+            .clone()
+            .unwrap_or_else(|| self.version.unique_device_id.clone().to_uppercase())
     }
 
     fn get_normal_ua(&self, item: &str) -> String {
