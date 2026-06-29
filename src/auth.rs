@@ -256,7 +256,7 @@ async fn build_setup_headers<T: AnisetteProvider>(account: &AppleAccount<T>, os_
     map.extend(base_headers);
 
     map.extend([
-        ("Authorization", format!("Basic {}", base64::encode(format!("{}:{}", account.username.as_ref().unwrap().trim(), account.get_pet().expect("No pet b?"))))),
+        ("Authorization", format!("Basic {}", base64::encode(format!("{}:{}", account.username.as_ref().unwrap().trim(), account.get_delegate_password().expect("No delegate password?"))))),
         ("User-Agent", format!("iOS iPhone {} iPhone Setup Assistant", os_config.get_register_meta().software_version)),
         ("Cookie", "repairSteps=".to_string()),
         ("X-MMe-Country", "US".to_string()),
@@ -352,13 +352,17 @@ pub async fn request_update_account<T: AnisetteProvider>(account: &AppleAccount<
             }
         }
 
-        Ok((pages.remove("iCloud").unwrap_or_default(), UpdateAccountFinish::IOS { url: agree_url.expect("No agree url???") }))
+        let Some(url) = agree_url else {
+            log::error!("genericTermsUI returned no agreeUrl; account likely needs device-side repair. Raw response:\n{}", String::from_utf8_lossy(&text));
+            return Err(PushError::MobileMeError("MOBILEME_TERMS_OF_SERVICE_UPDATE".to_string(), Some("no agreeUrl in terms UI".to_string())));
+        };
+        Ok((pages.remove("iCloud").unwrap_or_default(), UpdateAccountFinish::IOS { url }))
     }
 }
 
 
 pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T>, cookie: Option<&str>, os_config: &dyn OSConfig, delegates: &[LoginDelegate]) -> Result<DelegateResponses, PushError> {
-    let Some(pet) = account.get_pet() else { panic!("No pet!") };
+    let Some(pet) = account.get_delegate_password() else { panic!("No delegate password!") };
     let Some(spd) = &account.spd else { panic!("No spd!") };
 
     debug!("Got spd {:?}", spd);
@@ -404,6 +408,7 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
             .send()
             .await?;
     let text = resp.text().await?;
+    log::error!("delegate login raw response:\n{}", text);
 
     let parsed = plist::Value::from_reader(Cursor::new(text.as_str()))?;
     let parsed_dict = parsed.as_dictionary().unwrap();

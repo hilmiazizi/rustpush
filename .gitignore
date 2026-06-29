@@ -16,8 +16,16 @@
 /trustedpeers.plist
 /cloudkit.plist
 /caches.json
+/caches_sample.json
+/live_bbox.json
+*_bbox.json
+/bbox*.json
 /anisette_test/
 /anisette_test
 /certs/fairplay/*
 /keystore/target
 /saved_cred/
+# Local-only: on-device jailbreak/research toolkit + notes (SSH creds, serials, emails). Never publish.
+/iphone/
+# Run logs frequently contain GSA tokens, PETs, and Apple ID emails.
+*.log

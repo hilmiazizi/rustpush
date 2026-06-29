@@ -13,7 +13,7 @@ use omnisette::{default_provider, AnisetteHeaders, DefaultAnisetteProvider};
 use open_absinthe::nac::HardwareConfig;
 use openssl::{bn::BigNumContext, ec::{EcKey, PointConversionForm}, rsa::Rsa, sha::sha256};
 use plist::{Data, Dictionary, Value};
-use rustpush::{APSConnectionResource, APSState, Attachment, CircleClientSession, CircleServerSession, CompactECKey, ConversationData, DebugMutex, DebugRwLock, EntitlementAuthState, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IdmsAuthListener, IdmsMessage, IndexedMessagePart, KeyedArchive, LoginDelegate, MADRID_SERVICE, MMCSFile, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, ShareProfileMessage, SharedPoster, TokenProvider, UpdateProfileMessage, authenticate_apple, authenticate_smsless, cloud_messages::{CloudMessagesClient, MESSAGES_SERVICE}, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitSession, CloudKitState, DeleteRecordOperation, FetchZoneOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier}, facetime::{FACETIME_SERVICE, FTClient, FTMember, FTMessage, FTState, VIDEO_SERVICE}, findmy::{BeaconNamingRecord, FindMyClient, FindMyState, FindMyStateManager, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, keychain::{CloudKey, KEYCHAIN_ZONES, KeychainClient, KeychainClientState}, login_apple_delegates, macos::MacOSConfig, name_photo_sharing::{IMessageNameRecord, IMessageNicknameRecord, IMessagePosterRecord, ProfilesClient}, passwords::{PasswordManager, PasswordState, SHARED_PASSWORDS_SERVICE}, pcs::{PCSKey, PCSPrivateKey}, posterkit::{PhotoPosterContentsFrame, PosterType, SimplifiedIncomingCallPoster, SimplifiedPoster, SimplifiedTranscriptPoster, TranscriptDynamicUserData}, prepare_put, register, sharedstreams::{AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState, round_seconds}, statuskit::{StatusKitClient, StatusKitState, StatusKitStatus}};
+use rustpush::{APSConnectionResource, APSState, Attachment, Bbox, bbox_id_query, bbox_id_query_raw, CircleClientSession, CircleServerSession, CompactECKey, ConversationData, DebugMutex, DebugRwLock, EntitlementAuthState, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IdmsAuthListener, IdmsMessage, IndexedMessagePart, KeyedArchive, LoginDelegate, MADRID_SERVICE, MMCSFile, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, ShareProfileMessage, SharedPoster, TokenProvider, UpdateProfileMessage, authenticate_apple, authenticate_smsless, cloud_messages::{CloudMessagesClient, MESSAGES_SERVICE}, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitSession, CloudKitState, DeleteRecordOperation, FetchZoneOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier}, facetime::{FACETIME_SERVICE, FTClient, FTMember, FTMessage, FTState, VIDEO_SERVICE}, findmy::{BeaconNamingRecord, FindMyClient, FindMyState, FindMyStateManager, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, keychain::{CloudKey, KEYCHAIN_ZONES, KeychainClient, KeychainClientState}, login_apple_delegates, macos::MacOSConfig, name_photo_sharing::{IMessageNameRecord, IMessageNicknameRecord, IMessagePosterRecord, ProfilesClient}, passwords::{PasswordManager, PasswordState, SHARED_PASSWORDS_SERVICE}, pcs::{PCSKey, PCSPrivateKey}, posterkit::{PhotoPosterContentsFrame, PosterType, SimplifiedIncomingCallPoster, SimplifiedPoster, SimplifiedTranscriptPoster, TranscriptDynamicUserData}, prepare_put, register, request_update_account, sharedstreams::{AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState, round_seconds}, statuskit::{StatusKitClient, StatusKitState, StatusKitStatus}};
 use sha2::Sha256;
 use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}, process::Command, sync::RwLock};
 use tokio::io::AsyncWriteExt;
@@ -388,13 +388,22 @@ fn build_bbox(serial: &str, main_id: &str, state: &SavedState) -> Result<String,
     let id_rsa_pub = wrap_identity_key(&id_rsa.public_key_to_der_pkcs1()?);
     let (ec_pub, ec_priv, _, _) = legacy_keys_from_config()?;
 
+    // id-query validates the short-lived madrid registration cert (the one whose
+    // key signs the query), NOT the long-lived auth cert. They share the same RSA
+    // key, so id_key above stays correct; only the cert slot must use the madrid cert.
+    let id_cert = user
+        .registration
+        .get("com.apple.madrid")
+        .map(|r| r.id_keypair.cert.clone())
+        .unwrap_or_else(|| user.auth_keypair.cert.clone());
+
     let mut raw = Vec::new();
     append_bbox_tlv(&mut raw, BPINDEX_SN, serial.as_bytes());
     append_bbox_tlv(&mut raw, BPINDEX_MAIN_ID, main_id.as_bytes());
     append_bbox_tlv(&mut raw, BPINDEX_PUSH_TOKEN, token);
     append_bbox_tlv(&mut raw, BPINDEX_PUSH_CERT, &keypair.cert);
     append_bbox_tlv(&mut raw, BPINDEX_PUSH_KEY, &push_key);
-    append_bbox_tlv(&mut raw, BPINDEX_ID_CERT, &user.auth_keypair.cert);
+    append_bbox_tlv(&mut raw, BPINDEX_ID_CERT, &id_cert);
     append_bbox_tlv(&mut raw, BPINDEX_ID_PRIV_KEY, &id_key);
     append_bbox_tlv(&mut raw, BPINDEX_EC_PUB_KEY, &ec_pub);
     append_bbox_tlv(&mut raw, BPINDEX_EC_PRIV_KEY, &ec_priv);
@@ -406,8 +415,8 @@ fn build_bbox(serial: &str, main_id: &str, state: &SavedState) -> Result<String,
 }
 
 async fn load_bbox_serial(args: &[String]) -> Result<String, PushError> {
-    if let Some(serial) = arg_value(args, "--serial") {
-        return Ok(serial.to_string());
+    if let Some(serial) = flag_value(args, "--serial") {
+        return Ok(serial);
     }
     let config = resolve_relay_config(args, false).await;
     Ok(config.get_serial_number())
@@ -415,7 +424,7 @@ async fn load_bbox_serial(args: &[String]) -> Result<String, PushError> {
 
 async fn export_bbox_with_relay_defaults() {
     let args: Vec<String> = std::env::args().collect();
-    let output = arg_value(&args, "--output").unwrap_or("caches.json");
+    let output = flag_value(&args, "--output").unwrap_or_else(|| "caches.json".to_string());
 
     let _ = resolve_relay_config(&args, false).await;
 
@@ -446,8 +455,7 @@ async fn export_bbox_with_relay_defaults() {
             std::process::exit(1);
         }
     };
-    let main_id = arg_value(&args, "--main-id")
-        .map(|s| s.to_string())
+    let main_id = flag_value(&args, "--main-id")
         .or_else(|| primary_email(&saved.users[0]))
         .or_else(|| plist::from_file::<_, GsaConfig>("gsa.plist").ok().map(|g| g.user));
     let main_id = match main_id {
@@ -461,7 +469,7 @@ async fn export_bbox_with_relay_defaults() {
     match build_bbox(&serial, &main_id, &saved) {
         Ok(bbox) => {
             let json = serde_json::to_string_pretty(&vec![bbox]).unwrap();
-            fs::write(output, json).await.expect("failed to write output");
+            fs::write(&output, json).await.expect("failed to write output");
             println!("Wrote {} (1 entry)", output);
             println!("Serial: {serial}");
             println!("Main ID: {main_id}");
@@ -620,11 +628,13 @@ async fn relay_config(settings: &RelaySettings) -> Arc<RelayConfig> {
         "Fetching relay version info from {} (code {})",
         settings.host, settings.code
     );
+    let version = RelayConfig::get_versions(&settings.host, &settings.code, &token)
+        .await
+        .unwrap();
+    let icloud_ua = version.icloud_user_agent();
     Arc::new(RelayConfig {
-        version: RelayConfig::get_versions(&settings.host, &settings.code, &token)
-            .await
-            .unwrap(),
-        icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
+        version,
+        icloud_ua,
         aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
         dev_uuid: Uuid::new_v4().to_string(),
         protocol_version: 1640,
@@ -633,6 +643,79 @@ async fn relay_config(settings: &RelaySettings) -> Arc<RelayConfig> {
         beeper_token: token,
         udid: None,
     })
+}
+
+/// Prove a freshly-paired relay can mint validation-data on demand. This is the
+/// linchpin of iPhone-free renewal: registration/renewal needs exactly one
+/// device-bound input (validation-data) and everything else lives in our own
+/// persisted keys. If this succeeds, the relay can keep a fleet of identities
+/// alive without the phone being in the loop for anything else.
+async fn run_relay_test() {
+    let args: Vec<String> = std::env::args().collect();
+    let settings = match relay_settings_from_args(&args) {
+        Ok(s) => s,
+        Err(msg) => relay_settings_error(&msg),
+    };
+
+    let token = Some(RELAY_TOKEN.to_string());
+    info!(
+        "Relay test: fetching version info from {} (code {})",
+        settings.host, settings.code
+    );
+    let version = match RelayConfig::get_versions(&settings.host, &settings.code, &token).await {
+        Ok(v) => v,
+        Err(e) => {
+            error!("relay get-version-info FAILED: {e}");
+            eprintln!("\nRelay/provider unreachable or the code is wrong/expired.");
+            eprintln!("Make sure the mobile provider is still paired and online.");
+            std::process::exit(1);
+        }
+    };
+
+    let icloud_ua = version.icloud_user_agent();
+    let config = RelayConfig {
+        version,
+        icloud_ua,
+        aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
+        dev_uuid: Uuid::new_v4().to_string(),
+        protocol_version: 1640,
+        host: settings.host.clone(),
+        code: settings.code.clone(),
+        beeper_token: token,
+        udid: None,
+    };
+
+    let meta = config.get_register_meta();
+    println!("\n=== relay hardware identity (what validation-data is bound to) ===");
+    println!("  model  : {}", meta.hardware_version);
+    println!("  os     : {}", meta.os_version);
+    println!("  serial : {}", config.get_serial_number());
+    println!("  udid   : {}", config.get_udid());
+    println!("  ua     : {}", config.get_version_ua());
+
+    println!("\n=== minting validation-data (twice, to prove it is live) ===");
+    for i in 1..=2 {
+        match config.generate_validation_data().await {
+            Ok(data) => {
+                let b64 = base64_encode(&data);
+                let prefix: String = b64.chars().take(40).collect();
+                println!("  attempt {i}: OK  {} bytes  b64={}...", data.len(), prefix);
+            }
+            Err(e) => {
+                error!("generate_validation_data attempt {i} FAILED: {e}");
+                eprintln!("\nProvider answered version-info but cannot mint validation-data.");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    fs::write("hwconfig.plist", plist_to_string(&config).unwrap())
+        .await
+        .unwrap();
+    println!(
+        "\nSaved hwconfig.plist (serial {}). Relay is a working validation-data source.",
+        config.get_serial_number()
+    );
 }
 
 async fn resolve_relay_config(args: &[String], force_relay_fetch: bool) -> Arc<RelayConfig> {
@@ -660,6 +743,225 @@ async fn resolve_relay_config(args: &[String], force_relay_fetch: bool) -> Arc<R
     config
 }
 
+/// Pick one bbox out of a file that may be a JSON array of base64 strings
+/// (like `caches_sample.json`) or a single base64 blob (like `sample1.json`).
+fn pick_bbox(raw: &str, index: usize) -> String {
+    if let Ok(list) = serde_json::from_str::<Vec<String>>(raw) {
+        return list
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| panic!("bbox index {index} out of range ({} total)", list.len()));
+    }
+    raw.trim().to_string()
+}
+
+/// User-agent for the madrid-lookup request. Mirrors the relay's OS when a
+/// cached hwconfig.plist is available, otherwise a sane macOS default.
+fn bbox_version_ua() -> String {
+    if let Ok(cfg) = plist::from_file::<_, RelayConfig>("hwconfig.plist") {
+        return cfg.get_version_ua();
+    }
+    "[macOS,13.6.1,22G313,iMac19,1]".to_string()
+}
+
+/// Smoke test: load a bbox and run a single pure-HTTP id-query lookup.
+async fn run_bbox_lookup() {
+    init_keystore(SoftwareKeystore {
+        state: Default::default(),
+        update_state: Box::new(|_| {}),
+        encryptor: NoEncryptor,
+    });
+
+    let args: Vec<String> = std::env::args().collect();
+    let path = flag_value(&args, "--bbox-file").unwrap_or_else(|| "caches_sample.json".to_string());
+    let index: usize = flag_value(&args, "--bbox-index")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read bbox file {path}: {e}"));
+    let b64 = pick_bbox(&raw, index);
+
+    let bbox = Bbox::parse_b64(&b64).expect("failed to parse bbox");
+    info!(
+        "bbox loaded: serial={} self_uri={} service={}",
+        bbox.serial, bbox.self_uri, bbox.service
+    );
+
+    let id_keypair = bbox.id_keypair().expect("failed to import bbox identity key");
+    let targets = collect_lookup_targets(&args);
+    let version_ua = bbox_version_ua();
+
+    info!(
+        "pure-HTTP id-query: {} target(s), ua={version_ua}",
+        targets.len()
+    );
+
+    let response = match bbox_id_query_raw(
+        &id_keypair,
+        &bbox.push_token,
+        &bbox.self_uri,
+        &bbox.service,
+        1640,
+        &version_ua,
+        &targets,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            println!("LOOKUP FAILED: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    print_lookup_summary(&response, &targets);
+}
+
+/// Pull printable ASCII runs (>= 3 chars) out of a binary blob, mirroring the
+/// kt-account-key string extraction in reverse/response.json.
+fn ascii_strings(data: &[u8], min_len: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for &b in data {
+        if (0x20..0x7f).contains(&b) {
+            cur.push(b as char);
+        } else {
+            if cur.len() >= min_len {
+                out.push(std::mem::take(&mut cur));
+            } else {
+                cur.clear();
+            }
+        }
+    }
+    if cur.len() >= min_len {
+        out.push(cur);
+    }
+    out
+}
+
+fn dict_get<'a>(d: &'a Value, key: &str) -> Option<&'a Value> {
+    d.as_dictionary().and_then(|d| d.get(key))
+}
+
+fn as_bool(v: Option<&Value>) -> bool {
+    v.and_then(|v| v.as_boolean()).unwrap_or(false)
+}
+
+fn as_int(v: Option<&Value>) -> Option<i64> {
+    v.and_then(|v| v.as_signed_integer())
+}
+
+/// Numeric value that may come back from IDS as either an integer or a real.
+/// Formatted without a trailing `.0` when it's a whole number.
+fn as_num_str(v: Option<&Value>) -> String {
+    let n = v.and_then(|v| {
+        v.as_signed_integer()
+            .map(|i| i as f64)
+            .or_else(|| v.as_real())
+    });
+    match n {
+        Some(x) if x.fract() == 0.0 => format!("{}", x as i64),
+        Some(x) => format!("{x}"),
+        None => "-".to_string(),
+    }
+}
+
+/// Parse a raw IDS id-query response into a human-readable report and print it.
+/// Field mapping follows reverse/response.json.
+fn print_lookup_summary(response: &Value, targets: &[String]) {
+    let status = as_int(dict_get(response, "status")).unwrap_or(-1);
+    let empty = plist::Dictionary::new();
+    let results = dict_get(response, "results")
+        .and_then(|v| v.as_dictionary())
+        .unwrap_or(&empty);
+
+    let registered: Vec<&String> = targets
+        .iter()
+        .filter(|t| {
+            results
+                .get(*t)
+                .and_then(|u| dict_get(u, "identities"))
+                .and_then(|i| i.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+        })
+        .collect();
+
+    println!("============================================================");
+    println!("IDS id-query response   query_status={status}");
+    println!(
+        "targets={}   on_iMessage={}",
+        targets.len(),
+        registered.len()
+    );
+    println!("============================================================");
+
+    for uri in targets {
+        let Some(entry) = results.get(uri) else {
+            println!("\n{uri}\n   (no result returned)");
+            continue;
+        };
+
+        let identities = dict_get(entry, "identities")
+            .and_then(|i| i.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let per_status = as_int(dict_get(entry, "status")).unwrap_or(0);
+        let reg = !identities.is_empty();
+
+        println!(
+            "\n{uri}   {}   ({} device{})",
+            if reg { "REGISTERED" } else { "NOT registered" },
+            identities.len(),
+            if identities.len() == 1 { "" } else { "s" }
+        );
+        if per_status != 0 {
+            println!("   status: {per_status}");
+        }
+
+        if let Some(scid) = dict_get(entry, "sender-correlation-identifier").and_then(|v| v.as_string()) {
+            println!("   sender-correlation: {scid}");
+        }
+        if let Some(sh) = dict_get(entry, "short-handle").and_then(|v| v.as_string()) {
+            println!("   short-handle: {sh}");
+        }
+        if let Some(kt) = dict_get(entry, "kt-account-key").and_then(|v| v.as_data()) {
+            let strings = ascii_strings(kt, 3);
+            if !strings.is_empty() {
+                println!("   kt-account-key: [{}]", strings.join(", "));
+            }
+        }
+
+        for (idx, ident) in identities.iter().enumerate() {
+            let token_hex = dict_get(ident, "push-token")
+                .and_then(|v| v.as_data())
+                .map(|d| d.iter().map(|b| format!("{b:02x}")).collect::<String>())
+                .unwrap_or_default();
+            let cd = dict_get(ident, "client-data");
+            let ngm = as_num_str(cd.and_then(|c| dict_get(c, "public-message-identity-ngm-version")));
+            let idv = as_num_str(cd.and_then(|c| dict_get(c, "public-message-identity-version")));
+            let certified = cd.map(|c| as_bool(dict_get(c, "supports-certified-delivery-v1"))).unwrap_or(false);
+            let hdr = cd.map(|c| as_bool(dict_get(c, "supports-hdr"))).unwrap_or(false);
+            let stewie = cd.map(|c| as_bool(dict_get(c, "supports-stewie"))).unwrap_or(false);
+
+            println!(
+                "   device {}: push={token_hex}",
+                idx + 1
+            );
+            println!(
+                "            ngm={ngm} idv={idv} certified={} hdr={} stewie/satellite={}",
+                yn(certified), yn(hdr), yn(stewie)
+            );
+        }
+    }
+    println!();
+}
+
+fn yn(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
+}
+
 #[tokio::main(worker_threads = 1)]
 async fn main() {
     if let Err(_) = std::env::var("RUST_LOG") {
@@ -673,6 +975,16 @@ async fn main() {
 
     if has_flag(&args, "--export-bbox") {
         export_bbox_with_relay_defaults().await;
+        return;
+    }
+
+    if has_flag(&args, "--bbox-lookup") {
+        run_bbox_lookup().await;
+        return;
+    }
+
+    if has_flag(&args, "--relay-test") {
+        run_relay_test().await;
         return;
     }
 
@@ -795,49 +1107,109 @@ async fn main() {
     let mut users = if let Some(state) = saved_state.as_ref() {
         state.users.clone()
     } else {
-        // ask console for 2fa code, make sure it is only 6 digits, no extra characters
-        let tfa_closure = || {
-            println!("Enter 2FA code: ");
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input).unwrap();
-            input.trim().to_string()
-        };
-        
         let mut account = AppleAccount::new_with_anisette(config.get_gsa_config(&*connection.state.read().await, false), anisette_client.clone()).unwrap();
-        let result = account.login_email_pass(&gsa.user, gsa.pass.as_ref()).await.unwrap();
+        let mut login_state = account.login_email_pass(&gsa.user, gsa.pass.as_ref()).await.unwrap();
 
+        loop {
+            login_state = match login_state {
+                LoginState::NeedsSMS2FA => {
+                    let extras = account.get_auth_extras().await.unwrap();
+                    if let Some(state @ LoginState::NeedsSMS2FAVerification(_)) = extras.new_state {
+                        println!("A verification SMS has been sent to your trusted phone number.");
+                        state
+                    } else if let Some(phone) = extras.trusted_phone_numbers.first() {
+                        println!(
+                            "Sending verification SMS to {} (ends in {})...",
+                            phone.number_with_dial_code, phone.last_two_digits
+                        );
+                        account.send_sms_2fa_to_devices(phone.id).await.unwrap()
+                    } else {
+                        panic!("No trusted phone numbers on this Apple ID");
+                    }
+                }
+                LoginState::NeedsSMS2FAVerification(body) => {
+                    print!("Enter the 6-digit code from the SMS: ");
+                    std::io::stdout().flush().unwrap();
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).unwrap();
+                    account.verify_sms_2fa(input.trim().to_string(), body).await.unwrap()
+                }
+                LoginState::Needs2FAVerification => {
+                    print!("Enter the 6-digit verification code: ");
+                    std::io::stdout().flush().unwrap();
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).unwrap();
+                    account.verify_2fa(input.trim().to_string()).await.unwrap()
+                }
+                LoginState::NeedsDevice2FA => {
+                    println!("Apple requires two-factor authentication for this account.");
+                    println!("  1 = Send SMS code (recommended)");
+                    println!("  2 = Show code on a trusted iPhone/Mac");
+                    println!("  3 = Wait for sign-in approval here (often unreliable on Linux)");
+                    print!("Choose [1]: ");
+                    std::io::stdout().flush().unwrap();
+                    let mut choice = String::new();
+                    std::io::stdin().read_line(&mut choice).unwrap();
+                    match choice.trim() {
+                        "2" | "push" => account.send_2fa_to_devices().await.unwrap(),
+                        "3" | "circle" => break,
+                        _ => {
+                            let extras = account.get_auth_extras().await.unwrap();
+                            if let Some(state @ LoginState::NeedsSMS2FAVerification(_)) = extras.new_state {
+                                println!("A verification SMS has been sent to your trusted phone number.");
+                                state
+                            } else if let Some(phone) = extras.trusted_phone_numbers.first() {
+                                println!(
+                                    "Sending verification SMS to {} (ends in {})...",
+                                    phone.number_with_dial_code, phone.last_two_digits
+                                );
+                                account.send_sms_2fa_to_devices(phone.id).await.unwrap()
+                            } else {
+                                panic!("No trusted phone numbers on this Apple ID — try option 2 or 3");
+                            }
+                        }
+                    }
+                }
+                LoginState::LoggedIn => break,
+                LoginState::NeedsExtraStep(ref step) => {
+                    println!("Ignoring optional Apple ID step: {}", step);
+                    break;
+                }
+                other => panic!("Unexpected login state: {:?}", other),
+            }
+        }
 
         let spd = account.spd.as_ref().unwrap();
         let dsid = spd["DsPrsId"].as_unsigned_integer().unwrap();
 
-        // account.send_2fa_to_devices().await.unwrap();
-        // let result = account.verify_2fa(tfa_closure()).await.unwrap();
-
         let done = Arc::new(DebugMutex::new(account));
 
-        if let LoginState::NeedsDevice2FA = result {
+        if matches!(login_state, LoginState::NeedsDevice2FA) {
             let mut s = CircleClientSession::new(dsid, done.clone(), connection.get_token().await).await.unwrap();
 
             let listener = IdmsAuthListener::new(connection.clone()).await;
             let mut subscription = connection.messages_cont.subscribe();
 
-            
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input).unwrap();
-            let item = input.trim().to_string();
-
-            s.send_code(&item).await.unwrap();
-
+            println!("Waiting for Apple sign-in — approve on your iPhone/Mac, then enter the code when prompted.");
+            println!("If nothing appears within ~30s, press Ctrl+C and rerun; choose option 1 (SMS) instead.");
+            std::io::stdout().flush().unwrap();
 
             loop {
                 let msg = subscription.recv().await.unwrap();
-                
+
                 if let Some(test) = listener.handle(msg.clone()).unwrap() {
                     info!("here {test:?}");
                     match test {
                         IdmsMessage::TeardownSignIn(_) => info!("Teardown sign in"),
                         IdmsMessage::RequestedSignIn(_) => info!("requested sign in code {}", anisette_client.lock().await.provider.get_2fa_code().await.unwrap()),
                         IdmsMessage::CircleRequest(c, _) => {
+                            if c.step == 2 {
+                                print!("Enter the 6-digit verification code shown on your trusted device: ");
+                                std::io::stdout().flush().unwrap();
+                                let mut input = String::new();
+                                std::io::stdin().read_line(&mut input).unwrap();
+                                s.send_code(input.trim()).await.unwrap();
+                            }
                             if s.handle_circle_request(&c).await.unwrap().is_some() {
                                 session = Some(s);
                                 break;
@@ -851,31 +1223,50 @@ async fn main() {
         let account = done.lock().await;
 
         // account.update_postdata("Testing").await.unwrap();
-        let pet = account.get_pet().unwrap();
+        account.get_delegate_password().expect("Login succeeded but no delegate token was returned");
         let spd = account.spd.as_ref().unwrap();
 
-        let delegates = login_apple_delegates(&account, None, config.as_ref(), &[LoginDelegate::IDS, LoginDelegate::MobileMe]).await.unwrap();
+        // Delegate login. Burner / never-set-up accounts gate ALL delegates (even IDS) behind
+        // MOBILEME_TERMS_OF_SERVICE_UPDATE — the error is returned at the TOP LEVEL of the
+        // setup.icloud.com login, so requesting IDS-only does NOT avoid it. Auto-accept the
+        // iCloud ToS: first via the lightweight `termsAccepted=true` cookie, then by fetching
+        // the terms UI and POSTing its agreeUrl.
+        let delegate_list: &[LoginDelegate] = &[LoginDelegate::IDS, LoginDelegate::MobileMe];
+        let delegates = match login_apple_delegates(&account, None, config.as_ref(), delegate_list).await {
+            Err(PushError::MobileMeError(code, _)) if code == "MOBILEME_TERMS_OF_SERVICE_UPDATE" => {
+                info!("Accepting iCloud Terms of Service...");
+                match login_apple_delegates(&account, Some("termsAccepted=true"), config.as_ref(), delegate_list).await {
+                    Ok(delegates) => delegates,
+                    Err(PushError::MobileMeError(code, _)) if code == "MOBILEME_TERMS_OF_SERVICE_UPDATE" => {
+                        let (_, finish) = request_update_account(&account, config.as_ref()).await.unwrap();
+                        finish.accept_terms(delegate_list, &account, config.as_ref()).await.unwrap()
+                    }
+                    other => other.unwrap(),
+                }
+            }
+            other => other.unwrap(),
+        };
         let user = authenticate_apple(delegates.ids.unwrap(), config.as_ref()).await.unwrap();
 
-        let mobileme = delegates.mobileme.unwrap();
         let findmy = FindMyState::new(spd["DsPrsId"].as_unsigned_integer().unwrap().to_string());
 
         let id_path = PathBuf::from_str("findmy.plist").unwrap();
         std::fs::write(id_path, findmy.encode().unwrap()).unwrap();
 
-        let sharedstreams = SharedStreamsState::new(spd["DsPrsId"].as_unsigned_integer().unwrap().to_string(), &mobileme);
-
-        let id_path = PathBuf::from_str("sharedstreams.plist").unwrap();
-        std::fs::write(id_path, plist_to_string(&sharedstreams).unwrap()).unwrap();
-
-        let trustedpeers = KeychainClientState::new(spd["DsPrsId"].as_unsigned_integer().unwrap().to_string(), spd["adsid"].as_string().unwrap().to_string(), &mobileme);
-
-        let id_path = PathBuf::from_str("trustedpeers.plist").unwrap();
-        std::fs::write(id_path, plist_to_string(&trustedpeers).unwrap()).unwrap();
-
         let cloudkitstate = CloudKitState::new(spd["DsPrsId"].as_unsigned_integer().unwrap().to_string());
         let id_path = PathBuf::from_str("cloudkit.plist").unwrap();
         std::fs::write(id_path, plist_to_string(&cloudkitstate).unwrap()).unwrap();
+
+        // iCloud-only state needs the MobileMe delegate; skip when unavailable (VM).
+        if let Some(mobileme) = delegates.mobileme {
+            let sharedstreams = SharedStreamsState::new(spd["DsPrsId"].as_unsigned_integer().unwrap().to_string(), &mobileme);
+            let id_path = PathBuf::from_str("sharedstreams.plist").unwrap();
+            std::fs::write(id_path, plist_to_string(&sharedstreams).unwrap()).unwrap();
+
+            let trustedpeers = KeychainClientState::new(spd["DsPrsId"].as_unsigned_integer().unwrap().to_string(), spd["adsid"].as_string().unwrap().to_string(), &mobileme);
+            let id_path = PathBuf::from_str("trustedpeers.plist").unwrap();
+            std::fs::write(id_path, plist_to_string(&trustedpeers).unwrap()).unwrap();
+        }
 
         vec![user]
     };
