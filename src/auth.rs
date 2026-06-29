@@ -352,7 +352,11 @@ pub async fn request_update_account<T: AnisetteProvider>(account: &AppleAccount<
             }
         }
 
-        Ok((pages.remove("iCloud").unwrap_or_default(), UpdateAccountFinish::IOS { url: agree_url.expect("No agree url???") }))
+        let Some(url) = agree_url else {
+            log::error!("genericTermsUI returned no agreeUrl; account likely needs device-side repair. Raw response:\n{}", String::from_utf8_lossy(&text));
+            return Err(PushError::MobileMeError("MOBILEME_TERMS_OF_SERVICE_UPDATE".to_string(), Some("no agreeUrl in terms UI".to_string())));
+        };
+        Ok((pages.remove("iCloud").unwrap_or_default(), UpdateAccountFinish::IOS { url }))
     }
 }
 
@@ -408,6 +412,7 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
             .await?;
     let status = resp.status();
     let text = resp.text().await?;
+    log::error!("delegate login raw response:\n{}", text);
 
     if !status.is_success() {
         warn!("setup.icloud.com HTTP {} body:\n{}", status, text);

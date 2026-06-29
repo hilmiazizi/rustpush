@@ -999,6 +999,82 @@ impl IDSUser {
     }
 }
 
+/// Perform a pure-HTTP IDS `id-query` lookup using a bbox-derived identity.
+///
+/// Unlike [`IDSUser::query`], this talks straight to the `id-query` HTTPS endpoint
+/// (the same path p-radar uses) instead of tunneling the request over APNs, so it
+/// needs no live push connection, anisette, validation data, or registration —
+/// only the identity keypair and push token carried in the bbox.
+pub async fn bbox_id_query(
+    id_keypair: &KeyPairNew<RsaKey>,
+    push_token: &[u8; 32],
+    self_uri: &str,
+    service: &str,
+    protocol_version: u32,
+    version_ua: &str,
+    targets: &[String],
+) -> Result<HashMap<String, IDSLookupUser>, PushError> {
+    let value = bbox_id_query_raw(
+        id_keypair,
+        push_token,
+        self_uri,
+        service,
+        protocol_version,
+        version_ua,
+        targets,
+    )
+    .await?;
+
+    let loaded: IDSLookupResp = plist::from_value(&value)?;
+    if loaded.status != 0 || loaded.results.is_none() {
+        return Err(PushError::LookupFailed(IDSError(loaded.status)));
+    }
+
+    Ok(loaded.results.unwrap())
+}
+
+/// Same as [`bbox_id_query`] but returns the full, untyped IDS response plist so
+/// callers can surface every field (kt-account-key, short-handle, per-device
+/// capability flags, etc.) that the typed structs don't model.
+pub async fn bbox_id_query_raw(
+    id_keypair: &KeyPairNew<RsaKey>,
+    push_token: &[u8; 32],
+    self_uri: &str,
+    service: &str,
+    protocol_version: u32,
+    version_ua: &str,
+    targets: &[String],
+) -> Result<Value, PushError> {
+    let body = plist_to_buf(&LookupReq { uris: targets.to_vec() })?;
+    let aps_state = APSState { token: Some(*push_token), keypair: None };
+
+    let mut request = SignedRequest::new("id-query", Method::POST)
+        .header("x-id-self-uri", self_uri)
+        .header("x-push-token", &base64_encode(push_token))
+        .header("x-protocol-version", &protocol_version.to_string())
+        .header("user-agent", &format!("com.apple.madrid-lookup {version_ua}"))
+        .header("content-encoding", "gzip");
+    if service != "com.apple.madrid" {
+        request = request.header("x-id-sub-service", service);
+    }
+
+    let response = request
+        .body(gzip(&body)?)
+        .sign(id_keypair, KeyType::Id, &aps_state, None)?
+        .send(&REQWEST)
+        .await?;
+
+    let bytes = response.bytes().await?;
+    // The endpoint may or may not gzip its response (and REQWEST may auto-inflate);
+    // try parsing as-is, then fall back to a manual gunzip.
+    let value: Value = match plist::from_bytes(&bytes) {
+        Ok(v) => v,
+        Err(_) => plist::from_bytes(&crate::util::ungzip(&bytes)?)?,
+    };
+
+    Ok(value)
+}
+
 #[derive(Debug)]
 pub struct IDSError(pub u64);
 

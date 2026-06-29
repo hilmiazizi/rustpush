@@ -28,6 +28,8 @@ pub mod macos;
 
 mod relay;
 
+pub mod bbox;
+
 pub mod mmcsp {
     include!(concat!(env!("OUT_DIR"), "/mmcsp.rs"));
 }
@@ -48,7 +50,8 @@ pub use imessage::messages::{TypingApp, SetTranscriptBackgroundMessage, UpdatePr
 pub use imessage::aps_client::{IMClient, MADRID_SERVICE};
 use util::encode_hex;
 pub use util::{NSArrayClass, EntitlementsResponse, EntitlementAuthState, ResourceState, NSDictionaryClass, NSURL, NSArray, ResourceFailure, NSAttributedString, NSString, NSDictionaryTypedCoder, NSNumber, coder_encode_flattened, coder_decode_flattened, StCollapsedValue};
-pub use ids::user::{IDSUser, register, IDSUserIdentity, IDSNGMIdentity, PrivateDeviceInfo, SupportAlert, SupportAction, ReportMessage};
+pub use ids::user::{IDSUser, register, bbox_id_query, bbox_id_query_raw, IDSUserIdentity, IDSNGMIdentity, PrivateDeviceInfo, SupportAlert, SupportAction, ReportMessage, IDSLookupUser};
+pub use bbox::Bbox;
 pub use ids::identity_manager::{SendJob, MessageTarget, IdentityManager, KeyCache};
 pub use ids::CertifiedContext;
 pub use auth::{authenticate_apple, login_apple_delegates, authenticate_phone, authenticate_smsless, AuthPhone, LoginDelegate, CircleClientSession, TokenProvider};
@@ -100,6 +103,10 @@ pub trait OSConfig: Sync + Send {
         self.get_mme_clientinfo(for_item)
     }
 
+    fn get_akd_user_agent(&self) -> String {
+        "akd/1.0 CFNetwork/1494.0.7 Darwin/23.4.0".to_string()
+    }
+
     fn get_gsa_config(&self, push: &APSState, require_mac: bool) -> LoginClientInfo {
         LoginClientInfo {
             ak_context_type: "imessage".to_string(),
@@ -107,7 +114,7 @@ pub trait OSConfig: Sync + Send {
             client_bundle_id: "com.apple.MobileSMS".to_string(),
             mme_client_info_akd: self.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.akd/1.0)", require_mac),
             mme_client_info: self.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.MobileSMS/1262.500.151.1.2)", require_mac),
-            akd_user_agent: "akd/1.0 CFNetwork/1494.0.7 Darwin/23.4.0".to_string(),
+            akd_user_agent: self.get_akd_user_agent(),
             browser_user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)".to_string(),
             hardware_headers: self.get_gsa_hardware_headers(),
             push_token: push.token.map(|i| encode_hex(&i).to_uppercase()),

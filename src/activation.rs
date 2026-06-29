@@ -128,7 +128,14 @@ pub async fn activate(os_config: &dyn OSConfig) -> Result<KeyPairNew<RsaKey>, Pu
         .text().await?;
 
     let protocol = Regex::new(r"<Protocol>(.*)</Protocol>").unwrap();
-    let captures = protocol.captures(&request).ok_or(PushError::AlbertCertParseError)?;
+    let captures = match protocol.captures(&request) {
+        Some(c) => c,
+        None => {
+            log::error!("Albert activation: no <Protocol> in response (device={}). Body:\n{}",
+                os_config.get_activation_device(), request);
+            return Err(PushError::AlbertCertParseError);
+        }
+    };
     
     let parsed: Value = plist::from_bytes(captures[1].as_bytes())?;
 
