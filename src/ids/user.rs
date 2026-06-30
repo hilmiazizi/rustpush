@@ -1168,6 +1168,12 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
     }).collect::<Vec<_>>();
 
     let register_meta = config.get_register_meta();
+    let validation_data = config.generate_validation_data().await?;
+    // Debug aid: dump the EXACT validation-data blob this registration sends, so it can
+    // be byte-compared against a known baa:false mint. Gated by env, no-op otherwise.
+    if let Ok(out) = std::env::var("RUSTPUSH_REG_VALDATA_OUT") {
+        let _ = std::fs::write(&out, &validation_data);
+    }
     let body = Value::Dictionary(Dictionary::from_iter([
         ("device-name", Value::String(config.get_device_name())),
         ("hardware-version", Value::String(register_meta.hardware_version)),
@@ -1176,7 +1182,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
         ("private-device-data", Value::Dictionary(config.get_private_data())),
         ("services", Value::Array(services)),
         ("software-version", Value::String(register_meta.software_version)),
-        ("validation-data", Value::Data(config.generate_validation_data().await?))
+        ("validation-data", Value::Data(validation_data))
     ].into_iter()));
 
     let mut request = SignedRequest::new("id-register", Method::POST)

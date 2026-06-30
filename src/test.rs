@@ -694,12 +694,17 @@ async fn run_relay_test() {
     println!("  ua     : {}", config.get_version_ua());
 
     println!("\n=== minting validation-data (twice, to prove it is live) ===");
+    // Optional: dump the raw blob for offline analysis (baa:true vs baa:false diff).
+    // Set RUSTPUSH_VALDATA_OUT=path to save the last minted blob (.bin + .b64).
+    let valdata_out = std::env::var("RUSTPUSH_VALDATA_OUT").ok();
+    let mut last_blob: Option<Vec<u8>> = None;
     for i in 1..=2 {
         match config.generate_validation_data().await {
             Ok(data) => {
                 let b64 = base64_encode(&data);
                 let prefix: String = b64.chars().take(40).collect();
                 println!("  attempt {i}: OK  {} bytes  b64={}...", data.len(), prefix);
+                last_blob = Some(data);
             }
             Err(e) => {
                 error!("generate_validation_data attempt {i} FAILED: {e}");
@@ -707,6 +712,11 @@ async fn run_relay_test() {
                 std::process::exit(1);
             }
         }
+    }
+    if let (Some(out), Some(blob)) = (valdata_out, last_blob.as_ref()) {
+        let _ = fs::write(&out, blob).await;
+        let _ = fs::write(format!("{out}.b64"), base64_encode(blob)).await;
+        println!("  saved raw validation-data -> {out} ({} bytes) + {out}.b64", blob.len());
     }
 
     fs::write("hwconfig.plist", plist_to_string(&config).unwrap())
@@ -1113,13 +1123,29 @@ async fn main() {
 
     let mut subscription = connection.messages_cont.subscribe();
 
-    let mut anisette_client = default_provider(config.get_gsa_config(&*connection.state.read().await, false), PathBuf::from_str("anisette_test").unwrap());
+    // Per-account anisette state: each Apple ID provisions and persists its OWN
+    // software-ADI machine identity, so accounts no longer share one
+    // X-Apple-I-MD-M fingerprint (the cross-account correlation vector). Keyed by
+    // a filesystem-safe form of the account email; the bound machine is preserved
+    // on disk in case this account is re-authed/renewed later.
+    let anisette_account_key: String = gsa.user.trim().chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .collect();
+    let anisette_dir = PathBuf::from_str("anisette_test").unwrap();
+    let _ = std::fs::create_dir_all(&anisette_dir);
+    let anisette_state_path = anisette_dir.join(format!("{anisette_account_key}.plist"));
+    eprintln!("Anisette state: {} (per-account machine-id)", anisette_state_path.display());
+    let mut anisette_client = default_provider(config.get_gsa_config(&*connection.state.read().await, false), anisette_state_path);
 
     let mut session: Option<CircleClientSession<DefaultAnisetteProvider>> = None;
     
     if let Some(error) = error {
         panic!("{}", error);
     }
+    // Carries the AppleAccount from the fresh-login path so we DON'T log in a second
+    // time below. Apple throttles back-to-back GSA SRP logins for the same account
+    // with AuthSrpWithMessage(-36607) "Try again later", which used to crash register.
+    let mut logged_in_account = None;
     let mut users = if let Some(state) = saved_state.as_ref() {
         state.users.clone()
     } else {
@@ -1199,6 +1225,7 @@ async fn main() {
         let dsid = spd["DsPrsId"].as_unsigned_integer().unwrap();
 
         let done = Arc::new(DebugMutex::new(account));
+        logged_in_account = Some(done.clone());
 
         if matches!(login_state, LoginState::NeedsDevice2FA) {
             let mut s = CircleClientSession::new(dsid, done.clone(), connection.get_token().await).await.unwrap();
@@ -1294,9 +1321,15 @@ async fn main() {
         vec![user]
     };
 
-    // TODO DO NOT COMMIT
-    let conf = (gsa.user.clone(), gsa.pass.as_ref().to_vec());
-    let appleid_closure = move || conf.clone();
+    // Only log in here for the saved-state path (no live AppleAccount exists). The
+    // fresh-login path already authenticated above and carried its account in
+    // `logged_in_account`; logging in again would be a second back-to-back GSA SRP
+    // login that Apple throttles with -36607 ("Try again later").
+    let acc = if logged_in_account.is_some() {
+        None
+    } else {
+        let conf = (gsa.user.clone(), gsa.pass.as_ref().to_vec());
+        let appleid_closure = move || conf.clone();
         // ask console for 2fa code, make sure it is only 6 digits, no extra characters
         let tfa_closure = || {
             println!("Enter 2FA code: ");
@@ -1304,9 +1337,9 @@ async fn main() {
             std::io::stdin().read_line(&mut input).unwrap();
             input.trim().to_string()
         };
-
-    let acc = AppleAccount::login(appleid_closure, tfa_closure, 
-        config.get_gsa_config(&*connection.state.read().await, false), anisette_client.clone()).await;
+        Some(AppleAccount::login(appleid_closure, tfa_closure,
+            config.get_gsa_config(&*connection.state.read().await, false), anisette_client.clone()).await)
+    };
     
 
     // let mut entitlementstate = EntitlementAuthState::new("0310260600163417@nai.epc.mnc260.mcc310.3gppnetwork.org".to_string(), "310260".to_string(), "358565077172633".to_string());
@@ -1332,7 +1365,7 @@ async fn main() {
     // panic!("test {:?}", entitlementresult.phone);
 
 
-    let account = Arc::new(DebugMutex::new(acc.unwrap()));
+    let account = logged_in_account.unwrap_or_else(|| Arc::new(DebugMutex::new(acc.unwrap().unwrap())));
     
     account.lock().await.update_postdata("Apple Device", None, &["icloud", "imessage", "facetime"]).await.unwrap();
 
