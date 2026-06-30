@@ -1,19 +1,66 @@
 # rustpush
 
-Rust library and test CLI for Apple messaging infrastructure: IDS registration, iMessage lookup (`id-query`), APNs, and related services. The `rustpush-test` binary is the main entry point for registering an identity and running bulk phone/email lookups (same IDS API used by tools like p-radar).
+Rust library and test CLI for Apple messaging infrastructure: IDS registration, iMessage
+lookup (`id-query`), APNs, and related services. The `rustpush-test` binary is the main
+entry point for registering an iMessage identity and running phone/email lookups (the same
+IDS API used by tools like p-radar).
+
+This fork is wired for **off-device registration through a jailbroken iPhone relay** that
+mints validation data on the spoofable `baa:false` (software Absinthe) path, so each Apple
+ID is registered with a **rotatable, per-account device identity** instead of being bound to
+one real device. No macOS VM is required.
+
+---
+
+## How it actually works
+
+```
+┌──────────────────┐   relay code   ┌─────────────────────┐   validation data   ┌──────────────┐
+│  rustpush-test   │ ─────────────► │  Beeper relay        │ ──────────────────► │  iPhone      │
+│  (Linux / WSL2)  │ ◄───────────── │  (registration-relay)│ ◄────────────────── │  beepserv*   │
+└────────┬─────────┘  version-info  └─────────────────────┘    get-version-info  └──────────────┘
+         │ GSA login (per-account anisette machine-id)
+         ▼
+┌──────────────────┐        id-register / id-query / iMessage        ┌──────────────────┐
+│  Anisette v3      │ ◄────────────────────────────────────────────► │  Apple APNs + IDS │
+│  (software ADI)   │                                                 │                  │
+└──────────────────┘                                                 └──────────────────┘
+```
+
+\* The phone runs a spoofing fork of beepserv
+([hilmiazizi/phone-registration-provider](https://github.com/hilmiazizi/phone-registration-provider)).
+
+Two device identities are involved, and **both are spoofable/rotatable** in this setup:
+
+| Identity | Used for | Source | Rotates per account? |
+|----------|----------|--------|----------------------|
+| **Validation data** (serial / UDID / IMEI) | IDS `id-register` | iPhone beepserv fork, `baa:false` path | Yes — on-phone, via rotate flag |
+| **Anisette machine-id** (`X-Apple-I-MD-M`) | GSA Apple-ID login | software ADI, `anisette_test/<account>.plist` | Yes — per-account state file |
+
+### Why `baa:false`
+
+Apple's `baa:true` path attests the registration with the Secure Enclave against the real,
+fused-in serial — **not spoofable**. The beepserv fork forces the **`baa:false` software
+Absinthe path**, where the serial/UDID/IMEI are read from MobileGestalt (which the fork
+hooks). That lets a **fabricated-but-valid iPhone identity** be folded into the validation
+blob and accepted by Apple off-device. See the fork's docs for the hook details.
+
+---
 
 ## Requirements
 
 | Requirement | Notes |
 |-------------|--------|
-| **Rust** | Stable toolchain (`rustup` recommended). Edition 2021. |
-| **Build tools** | `build-essential`, `pkg-config`, `libssl-dev` (OpenSSL builds vendored, but headers help on some distros). |
+| **Rust** | Stable toolchain (`rustup`). Edition 2021. |
+| **Build tools** | `build-essential`, `pkg-config`, `libssl-dev`. |
 | **Git submodules** | `apple-private-apis` and `open-absinthe` must be initialized. |
-| **Network** | Outbound HTTPS to Apple (APNs, GSA, IDS), SideStore Anisette (`ani.sidestore.io`), and your registration relay. |
-| **Registration relay + macOS VM** | Required for **first registration** only. A macOS host running [mac-registration-provider](https://github.com/beeper/mac-registration-provider) must be reachable through a Beeper-style relay. Lookup works from cached plists without the VM. |
-| **Apple ID** | Account with iMessage enabled. Device 2FA / Circle approval during first login. |
+| **Network** | Outbound HTTPS to Apple (APNs, GSA, IDS), an anisette-v3 server (default `ani.sidestore.io`), and your registration relay. |
+| **iPhone relay** | Required for **registration only**. A jailbroken iPhone running the beepserv spoofing fork, paired to a relay, reachable by relay code. Lookup works from cached plists / BBOX without the phone. |
+| **Apple ID** | Account with iMessage enabled; 2FA handled at first login. |
 
-Works on Linux (WSL2/Ubuntu tested). No physical iPhone required after initial plist bundle is saved.
+Works on Linux (WSL2/Ubuntu tested).
+
+---
 
 ## Install
 
@@ -31,71 +78,95 @@ cargo build --release \
 
 Binary: `target/release/rustpush-test`
 
-## Configure the registration relay
+---
 
-Registration needs a relay pairing code from your mac-registration-provider VM (one code per VM/identity).
+## Registration (one-shot, per account)
+
+Registration needs a **relay code** from your paired iPhone beepserv fork. The phone supplies
+both the `get-version-info` identity and the minted `baa:false` validation data; rustpush does
+GSA login + Albert activation + IDS registration entirely off-device.
 
 ```bash
-# Fresh register (always fetches new hwconfig from relay)
 RUST_LOG=info ./target/release/rustpush-test \
   --register \
   --relay-code=YOUR-RELAY-CODE
+```
 
+```bash
 # Self-hosted relay (optional; default is https://registration-relay.beeper.com)
-./target/release/rustpush-test \
-  --register \
+./target/release/rustpush-test --register \
   --relay-host=https://relay.example.com \
   --relay-code=YOUR-RELAY-CODE
 ```
 
-The Beeper access token is built into the binary. Override relay host/code via CLI or env:
+Relay host/code can also come from env:
 
 - `RUSTPUSH_RELAY_CODE`
 - `RUSTPUSH_RELAY_HOST`
 
-After the first successful register, `hwconfig.plist` is cached. Lookup skips relay unless you pass `--register` again (which forces a fresh relay fetch).
-
-## First-time registration
-
-1. Start the macOS VM and registration relay bridge (mac-registration-provider connected to your relay).
-2. From the repo root, run:
-
-```bash
-RUST_LOG=info ./target/release/rustpush-test --register --relay-code=YOUR-RELAY-CODE
-```
-
-3. Enter Apple ID and password when prompted (or pre-create `gsa.plist` — see below).
-4. Complete Device 2FA / Circle sign-in when asked.
-5. On success, the tool writes runtime state in the current directory:
+The flow: enter Apple ID + password (or pre-seed `gsa.plist`), complete 2FA once, then the tool
+authenticates **a single time** and registers. On success it writes local state:
 
 | File | Purpose |
 |------|---------|
 | `config.plist` | IDS users, push state, identity keys |
-| `hwconfig.plist` | Hardware/relay config (serial, OS version UA) |
+| `hwconfig.plist` | Relay hardware config (the **spoofed serial**, OS UA) |
 | `keystore.plist` | Software keystore for signing keys |
 | `gsa.plist` | Cached Apple ID credentials (SHA-256 password) |
+| `anisette_test/<account>.plist` | Per-account anisette machine identity |
 | `id_cache.plist` | Lookup cache (created on use) |
 
-These files are **local secrets** — do not commit them. After this step, the VM can stay off for lookup-only runs.
+These are **local secrets — do not commit them.**
 
-Optional `gsa.plist` format (skips interactive username/password):
+### Per-account anisette machine-id
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>user</key>
-  <string>you@icloud.com</string>
-  <key>pass</key>
-  <data><!-- SHA-256 of password as raw bytes --></data>
-</dict>
-</plist>
+Each Apple ID provisions and persists its **own** software-ADI machine identity at
+`anisette_test/<sanitized-email>.plist`. This stops every account sharing one
+`X-Apple-I-MD-M` fingerprint (a strong cross-account correlation signal). The bound machine is
+kept on disk so the account can be re-authed later. For real isolation at volume, also
+self-host the anisette-v3 server (e.g. `dadoum/anisette-v3-server`) and vary egress IP instead
+of using the shared public `ani.sidestore.io`.
+
+### Single login on register
+
+`--register` authenticates with GSA **once** and reuses that session. (Previously the flow did
+a second back-to-back SRP login, which Apple throttles with `AuthSrpWithMessage(-36607)`
+"Try again later" and crashed registration before it completed.)
+
+---
+
+## Rotating the device identity (per account)
+
+The phone serves a **persisted** identity until you explicitly rotate it. Two daemons read the
+spoof plist and **both** must be restarted, in order, or version-info and the minted blob will
+report different serials:
+
+```bash
+# On the iPhone (rootful jailbreak shown; use /var/jb paths for rootless):
+touch /var/mobile/.beepserv_rotate     # request a fresh identity
+killall -9 beepservd                   # respawns -> generates new serial/UDID/IMEI, consumes flag
+sleep 3                                 # let the new /var/mobile/.beepserv_spoof.plist land
+killall -9 identityservicesd           # respawns -> re-reads the new plist for validation minting
 ```
+
+```bash
+# On Linux, before the next --register:
+rm -f hwconfig.plist gsa.plist          # force fresh version-info + new account prompt
+```
+
+Then run `--register` for the new account. It re-fetches the new serial and mints validation
+data bound to the same new identity. Combined with per-account anisette, each account gets a
+unique serial **and** a unique machine-id.
+
+> The beepserv fork keeps real per-MODEL parts (plant/config of the serial, IMEI TAC) and only
+> randomizes per-UNIT fields, so the spoofed tuple stays a plausible `iPhone9,3`.
+
+---
 
 ## IDS lookup (fast path)
 
-When `config.plist`, `hwconfig.plist`, and `keystore.plist` exist with a registered user, lookup skips relay login, GSA, and re-registration:
+When `config.plist`, `hwconfig.plist`, and `keystore.plist` exist with a registered user,
+lookup skips relay, GSA, and re-registration:
 
 ```bash
 RUST_LOG=info ./target/release/rustpush-test --test-lookup \
@@ -104,31 +175,32 @@ RUST_LOG=info ./target/release/rustpush-test --test-lookup \
   mailto:friend@icloud.com
 ```
 
-Targets can be passed as positional arguments or with `--target`:
+Targets can be positional or `--target`:
 
 ```bash
 ./target/release/rustpush-test --test-lookup --target +15551234567
 ```
 
-Phone numbers accept `tel:+1…`, `+1…`, or bare digits. Emails accept `mailto:…` or plain addresses.
+Phone numbers accept `tel:+1…`, `+1…`, or bare digits. Emails accept `mailto:…` or plain
+addresses. Output prints `LOOKUP OK`, the self-handle, queried URIs, and `valid` (targets with
+at least one iMessage identity). Lookups go through IDS via APNs in batches (chunks of 18).
 
-Output prints `LOOKUP OK`, the registered self-handle, queried URIs, and `valid` (targets with at least one iMessage identity). Lookups go through Apple IDS via APNs in batches (library chunks of 18).
+If plists are missing/empty, `--test-lookup` falls through to the full registration flow.
 
-If plists are missing or empty, `--test-lookup` falls through to the full registration flow instead.
+---
 
 ## BBOX: portable iMessage identity
 
-A **BBOX** ("binary box") is a single self-contained, base64-encoded blob that bundles
-everything needed to *act as* a registered iMessage identity, independent of the runtime
-plists:
+A **BBOX** ("binary box") is a single base64 blob bundling everything needed to *act as* a
+registered iMessage identity, independent of the runtime plists:
 
 - the registered **self handle** (e.g. `mailto:you@icloud.com`) and **service** (`com.apple.madrid`)
 - the device **serial** the identity was registered against
 - the APNs **push token**
-- the IDS **identity certificate** + its **private key** (and the EC/RSA key material p-radar signs with)
+- the IDS **identity certificate** + **private key** (the EC/RSA material p-radar signs with)
 
-This is the same container format p-radar-style tooling consumes. Once exported, a BBOX can run
-lookups on its own — no `config.plist`, no relay, no GSA login, no APNs session required.
+Once exported, a BBOX runs lookups on its own — no `config.plist`, no relay, no GSA, no APNs
+session.
 
 > A BBOX contains private keys and grants full use of the identity. **Treat it as a secret.**
 > All `*.json` bbox caches are git-ignored by default.
@@ -152,13 +224,13 @@ After a successful registration (`config.plist` present):
   --output mybox.json --serial F4JSDXCEHG7K --main-id you@icloud.com
 ```
 
-Output is a JSON **array** (so multiple identities can be collected into one file); each element
-is one base64 BBOX entry.
+Output is a JSON **array** (multiple identities can be collected in one file); each element is
+one base64 BBOX entry.
 
 ### Use a BBOX (offline lookup)
 
 `--bbox-lookup` loads an identity straight from a BBOX file and runs a **pure-HTTP** `id-query`
-(signed with the BBOX's own key) — no login, no APNs connection:
+(signed with the BBOX's own key) — no login, no APNs:
 
 ```bash
 ./target/release/rustpush-test --bbox-lookup --bbox-file caches.json \
@@ -170,54 +242,46 @@ is one base64 BBOX entry.
 | `--bbox-file FILE` | `caches_sample.json` | BBOX JSON array to load from. |
 | `--bbox-index N` | `0` | Which entry in the array to use. |
 
-It prints `query_status`, and for each target whether it is `REGISTERED` (with per-device push
-token, NGM/identity versions, and capability flags) or `NOT registered`.
+It prints `query_status` and, per target, `REGISTERED` (with push token, NGM/identity
+versions, capability flags) or `NOT registered`.
 
-**`--bbox-lookup` (offline, BBOX) vs `--test-lookup` (live APNs, plists):** both hit the same IDS
-`id-query`. `--bbox-lookup` is self-contained from a BBOX and signs over HTTP; `--test-lookup`
-uses the live `config.plist` identity over an APNs session (the path p-radar uses). If a healthy
-identity returns `status 0` but **zero identities for every target including known-valid handles
-and itself**, the identity has been disabled by Apple at the account level (see `6009` below) —
-it is not a query bug.
+**`--bbox-lookup` (offline) vs `--test-lookup` (live APNs):** both hit the same IDS `id-query`.
+If a healthy identity returns `status 0` but **zero identities for every target including
+known-valid handles and itself**, the identity/account has been disabled by Apple (see `6009`)
+— not a query bug.
 
-## Architecture (short)
-
-```
-┌─────────────────┐     validation/version     ┌──────────────────┐
-│  rustpush-test  │ ◄──────────────────────────► │ Beeper relay     │
-│  (Linux/WSL)    │                            │ → macOS VM       │
-└────────┬────────┘                            └──────────────────┘
-         │ GSA login headers
-         ▼
-┌─────────────────┐     id-query / messaging     ┌──────────────────┐
-│ SideStore       │                            │ Apple APNs + IDS │
-│ Anisette v3     │ ◄──────────────────────────► │                  │
-└─────────────────┘                            └──────────────────┘
-```
-
-- **Relay + VM**: hardware serial and validation blob for registration.
-- **Anisette**: Grand Slam / GSA request headers only.
-- **APNs/IDS**: actual lookup and iMessage traffic.
+---
 
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---------|----------------|
-| `DeviceNotFound` at startup | VM/relay not running or wrong relay code/token. |
-| `6005` / bad authentication | Plist bundle does not match relay VM serial; re-register with matching pair. |
-| `6009` | Apple temporarily blocked iMessage on this identity. |
-| Panic on exit after lookup | Fixed in recent builds (graceful APS topic drop). Rebuild if you see `APS backed up??`. |
-| Slow every lookup | Use fast path: ensure all three plists exist before `--test-lookup`. |
-| `response too large` in logs | Library auto-splits batch; normal for large target lists. |
+| `DeviceNotFound` at startup | Phone/relay not paired/online, or wrong relay code. |
+| `AuthSrpWithMessage(-36607)` | GSA login throttled ("Try again later"). Single-login is already the default; wait and retry, or rotate the per-account anisette state. |
+| Same serial across accounts | Phone identity not rotated — set the rotate flag and restart both daemons (see Rotating). |
+| Version-info serial ≠ minted serial | Only `beepservd` was restarted; restart `identityservicesd` too so `bp_spoof` re-reads the plist. |
+| `6005` / bad authentication | BBOX/plist push token stale (later registrations on the same device invalidate earlier bboxes). Re-export from a current registration. |
+| `6009` | Apple disabled iMessage on this account (account-level ban), not a device/spoof bug. |
+| `MOBILEME_TERMS_OF_SERVICE_UPDATE` | Burner account ToS gate; the tool auto-accepts and retries. |
+| Empty `valid: []` for known-good targets | Account is query-limited (low reputation) — registers fine, lookups return nothing. |
 
 Set log level with `RUST_LOG=info` or `RUST_LOG=debug`.
 
+Debug aids (env-gated, no-op when unset):
+
+- `RUSTPUSH_REG_VALDATA_OUT=path` — dump the exact validation-data blob sent at `id-register`.
+
+---
+
 ## Library
 
-Import `rustpush` from this repo as a path or git dependency. Core types: `IMClient`, `IDSUser`, `RelayConfig`, `register`, `APSConnectionResource`. See `src/lib.rs` exports.
+Import `rustpush` as a path or git dependency. Core types: `IMClient`, `IDSUser`,
+`RelayConfig`, `register`, `APSConnectionResource`. See `src/lib.rs` exports.
 
-Default crate features include `macos-validation-data`. Enable `remote-anisette-v3` for the SideStore Anisette provider used by the test binary.
+Default features include `macos-validation-data`. Enable `remote-anisette-v3` for the software
+anisette provider used by the test binary.
 
 ## License
 
-See repository license. Apple services are used at your own risk; comply with applicable terms of service.
+See repository license. Apple services are used at your own risk; comply with applicable terms
+of service.
