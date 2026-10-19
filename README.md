@@ -10,6 +10,17 @@ mints validation data on the spoofable `baa:false` (software Absinthe) path, so 
 ID is registered with a **rotatable, per-account device identity** instead of being bound to
 one real device. No macOS VM is required.
 
+The iPhone side (beepserv `.deb`, phone reset docs, SSH helper) lives in a **separate repo**:
+[hilmiazizi/phone-registration-provider](https://github.com/hilmiazizi/phone-registration-provider).
+
+Suggested layout:
+
+```
+~/imessage/
+├── rustpush/                      ← this repo (build rustpush-test here)
+└── phone-registration-provider/   ← beepserv .deb + docs/CLEAN.md + tools/_ssh.py
+```
+
 ---
 
 ## How it actually works
@@ -137,12 +148,12 @@ a second back-to-back SRP login, which Apple throttles with `AuthSrpWithMessage(
 
 ## Rotating the device identity (per account)
 
-The phone serves a **persisted** identity until you explicitly rotate it. Two daemons read the
-spoof plist and **both** must be restarted, in order, or version-info and the minted blob will
-report different serials:
+See **[phone-registration-provider/docs/CLEAN.md](https://github.com/hilmiazizi/phone-registration-provider/blob/main/docs/CLEAN.md)**
+for the full iOS 15 reset procedure (`launchctl kickstart`, rotate flag, relay code reset).
+
+Quick summary — on the iPhone (rootful; use `/var/jb` prefixes for rootless):
 
 ```bash
-# On the iPhone (rootful jailbreak shown; use /var/jb paths for rootless):
 touch /var/mobile/.beepserv_rotate     # request a fresh identity
 killall -9 beepservd                   # respawns -> generates new serial/UDID/IMEI, consumes flag
 sleep 3                                 # let the new /var/mobile/.beepserv_spoof.plist land

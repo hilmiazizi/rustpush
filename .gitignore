@@ -1,31 +1,46 @@
+# IDE
 .idea
+.vscode/
+
+# Rust build
 /target
 /cloudkit-derive/target
 /cloudkit-proto/target
 /open-absinthe/target
-/config.json
-/config.plist
+/keystore/target
 /out
 /jniLibs
-/id_cache.plist
+
+# Runtime registration state (secrets — never commit)
+/config.json
+/config.plist
 /hwconfig.plist
 /keystore.plist
 /gsa.plist
+/id_cache.plist
 /findmy.plist
 /sharedstreams.plist
 /trustedpeers.plist
 /cloudkit.plist
+/profiles.plist
+/anisette_test/
+
+# BBOX / identity export caches
 /caches.json
 /caches_sample.json
 /live_bbox.json
-*_bbox.json
-/bbox*.json
-/anisette_test/
-/anisette_test
-/certs/fairplay/*
-/keystore/target
-/saved_cred/
-# Local-only: on-device jailbreak/research toolkit + notes (SSH creds, serials, emails). Never publish.
-/iphone/
-# Run logs frequently contain GSA tokens, PETs, and Apple ID emails.
+/*.json
+
+# Validation-data / register debug dumps
+*.bin
+*.bin.b64
+valdata_*
+
+# Logs (GSA tokens, emails)
 *.log
+
+# Fairplay certs (fetched at build)
+/certs/fairplay/*
+
+# Legacy
+/saved_cred/

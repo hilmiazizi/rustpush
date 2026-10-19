@@ -642,6 +642,7 @@ async fn relay_config(settings: &RelaySettings) -> Arc<RelayConfig> {
         code: settings.code.clone(),
         beeper_token: token,
         udid: None,
+        fresh_identity: std::sync::Mutex::new(None),
     })
 }
 
@@ -683,6 +684,7 @@ async fn run_relay_test() {
         code: settings.code.clone(),
         beeper_token: token,
         udid: None,
+        fresh_identity: std::sync::Mutex::new(None),
     };
 
     let meta = config.get_register_meta();

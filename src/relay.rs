@@ -27,7 +27,7 @@ pub struct Versions {
     unique_device_id: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize)]
 pub struct RelayConfig {
     pub version: Versions,
     pub icloud_ua: String,
@@ -38,6 +38,29 @@ pub struct RelayConfig {
     pub code: String,
     pub beeper_token: Option<String>,
     pub udid: Option<String>,
+    /// Set after a validation-data fetch. That call rotates the phone identity,
+    /// so later serial/UDID reads in the same process follow the blob.
+    #[serde(skip)]
+    pub fresh_identity: std::sync::Mutex<Option<Versions>>,
+}
+
+impl Clone for RelayConfig {
+    fn clone(&self) -> Self {
+        Self {
+            version: self.version.clone(),
+            icloud_ua: self.icloud_ua.clone(),
+            aoskit_version: self.aoskit_version.clone(),
+            dev_uuid: self.dev_uuid.clone(),
+            protocol_version: self.protocol_version,
+            host: self.host.clone(),
+            code: self.code.clone(),
+            beeper_token: self.beeper_token.clone(),
+            udid: self.udid.clone(),
+            fresh_identity: std::sync::Mutex::new(
+                self.fresh_identity.lock().ok().and_then(|guard| guard.clone()),
+            ),
+        }
+    }
 }
 
 impl Versions {
@@ -70,6 +93,14 @@ impl Versions {
 }
 
 impl RelayConfig {
+    fn live_version(&self) -> Versions {
+        self.fresh_identity
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .unwrap_or_else(|| self.version.clone())
+    }
+
     pub async fn get_versions(host: &str, code: &str, beeper_token: &Option<String>) -> Result<Versions, PushError> {
         let mut data = REQWEST.post(format!("{}/api/v1/bridge/get-version-info", host))
             .bearer_auth(code)
@@ -116,15 +147,16 @@ impl OSConfig for RelayConfig {
             device_class: "MacOS".to_string(),
             product_type: "iMac13,1".to_string(),
             product_version: self.version.software_version.clone(),
-            serial_number: self.version.serial_number.clone(),
-            unique_device_id: self.version.unique_device_id.clone().to_uppercase(),
+            serial_number: self.live_version().serial_number.clone(),
+            unique_device_id: self.live_version().unique_device_id.clone().to_uppercase(),
         }
     }
 
     fn get_udid(&self) -> String {
+        let version = self.live_version();
         self.udid
             .clone()
-            .unwrap_or_else(|| self.version.unique_device_id.clone().to_uppercase())
+            .unwrap_or_else(|| version.unique_device_id.clone().to_uppercase())
     }
 
     fn get_normal_ua(&self, item: &str) -> String {
@@ -133,7 +165,7 @@ impl OSConfig for RelayConfig {
     }
 
     fn get_serial_number(&self) -> String {
-        self.version.serial_number.clone()
+        self.live_version().serial_number.clone()
     }
 
     fn get_mme_clientinfo(&self, item: &str) -> String {
@@ -146,6 +178,26 @@ impl OSConfig for RelayConfig {
         self.get_mme_clientinfo(item)
     }
 
+    fn get_gsa_config(&self, push: &crate::APSState, _require_mac: bool) -> crate::LoginClientInfo {
+        // new.ani.sidestore.io is the server from SideStore/SideStore#1652 that
+        // currently accepts GSA. Client info and UA are that server's
+        // /v3/client_info, used for both provisioning and login. No iPhone serial.
+        const CLIENT: &str = "<MacBookPro13,3> <Mac OS X;10.12.6;16G29> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+        const UA: &str = "akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0";
+        crate::LoginClientInfo {
+            ak_context_type: "imessage".to_string(),
+            client_app_name: "Messages".to_string(),
+            client_bundle_id: "com.apple.MobileSMS".to_string(),
+            mme_client_info: CLIENT.to_string(),
+            mme_client_info_akd: CLIENT.to_string(),
+            akd_user_agent: UA.to_string(),
+            browser_user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)".to_string(),
+            hardware_headers: HashMap::new(),
+            push_token: push.token.map(|token| crate::util::encode_hex(&token).to_uppercase()),
+            update_account_bundle_id: CLIENT.to_string(),
+        }
+    }
+
     fn get_aoskit_version(&self) -> String {
         self.aoskit_version.clone()
     }
@@ -155,9 +207,8 @@ impl OSConfig for RelayConfig {
     }
 
     fn get_gsa_hardware_headers(&self) -> HashMap<String, String> {
-        [
-            ("X-Apple-I-SRL-NO", &self.version.serial_number),
-        ].into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+        let serial = self.live_version().serial_number;
+        [("X-Apple-I-SRL-NO".to_string(), serial)].into_iter().collect()
     }
 
     fn get_version_ua(&self) -> String {
@@ -178,7 +229,7 @@ impl OSConfig for RelayConfig {
     }
 
     fn get_device_name(&self) -> String {
-        format!("iPhone-{}", self.version.serial_number)
+        format!("iPhone-{}", self.live_version().serial_number)
     }
 
     fn get_protocol_version(&self) -> u32 {
@@ -207,8 +258,16 @@ impl OSConfig for RelayConfig {
         }
 
         let result: DataResp = result.json().await?;
+        let blob = base64_decode(&result.data);
 
-        Ok(base64_decode(&result.data))
+        // The phone rotated while minting. Pull the identity that blob is bound to.
+        if let Ok(versions) = RelayConfig::get_versions(&self.host, &self.code, &self.beeper_token).await {
+            if let Ok(mut slot) = self.fresh_identity.lock() {
+                *slot = Some(versions);
+            }
+        }
+
+        Ok(blob)
     }
 
     fn get_register_meta(&self) -> RegisterMeta {
